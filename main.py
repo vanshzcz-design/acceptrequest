@@ -38,7 +38,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════
-BOT_TOKEN        = "8358164358:AAGZpXMb9J228nH_0qmfV-d5nYWgZvmzcts"
+BOT_TOKEN        = "8358164358:AAE5xKhSRAlsu3bK2_QkRP9omIDU2OOb42U"
 ADMIN_IDS        = [7353041224, 6527836651]
 ADMIN_ID         = ADMIN_IDS[0]
 CHANNEL_ID       = -1002701185142
