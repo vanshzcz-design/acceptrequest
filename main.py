@@ -253,15 +253,38 @@ async def safe_send(
     text: str,
     **kwargs
 ):
-    """Send a message; silently ignore if user blocked the bot."""
+    """
+    Send a private message safely.
+
+    Important Telegram limit:
+    the bot can DM a user only if the user has started the bot before
+    or Telegram currently allows the bot to message them from a join request.
+    """
     try:
         await ctx.bot.send_message(
-            uid, text,
+            chat_id=uid,
+            text=text,
             parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
             **kwargs
         )
+        return True
     except TelegramError as e:
-        logger.debug(f"safe_send uid={uid}: {e}")
+        logger.warning(f"safe_send failed uid={uid}: {e}")
+        return False
+
+
+def get_message_html_for_admin_panel(message) -> str:
+    """
+    Save admin-panel messages exactly as Telegram sends them.
+
+    - Premium animated/custom emojis are stored as <tg-emoji emoji-id=...>.
+    - Bold/italic/link entities copied from Telegram are preserved.
+    - If the admin typed raw HTML manually, keep it as raw HTML.
+    """
+    if getattr(message, "entities", None):
+        return message.text_html
+    return message.text or ""
 
 
 async def copy_channel_messages_to_user(
@@ -681,27 +704,45 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  CHAT MEMBER HANDLER  (joined / left)
 # ═══════════════════════════════════════════════════════
 async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Track channel joins/leaves and message users when they leave."""
     evt = update.chat_member
-    if not evt or evt.chat.id != CHANNEL_ID:
+    if not evt or not evt.chat or evt.chat.id != CHANNEL_ID:
         return
 
-    user       = evt.new_chat_member.user
-    uid_str    = str(user.id)
-    old_status = evt.old_chat_member.status
-    new_status = evt.new_chat_member.status
+    old_member = evt.old_chat_member
+    new_member = evt.new_chat_member
+    user = new_member.user
+    uid_str = str(user.id)
 
-    LEFT_STATUSES   = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
+    old_status = old_member.status
+    new_status = new_member.status
+
+    LEFT_STATUSES = {
+        ChatMemberStatus.LEFT,
+        ChatMemberStatus.BANNED,
+        "left",
+        "kicked",
+    }
     ACTIVE_STATUSES = {
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
+        "member",
+        "administrator",
+        "creator",
     }
 
+    old_is_active = old_status in ACTIVE_STATUSES
+    new_is_active = new_status in ACTIVE_STATUSES
+    old_is_left = old_status in LEFT_STATUSES
+    new_is_left = new_status in LEFT_STATUSES
+
+    first_name = user.first_name or "there"
+
     # ── JOINED ──────────────────────────────────────────
-    if old_status in LEFT_STATUSES and new_status in ACTIVE_STATUSES:
+    if old_is_left and new_is_active:
         if uid_str not in bot_data["members"]:
             bot_data["members"].append(uid_str)
-        # Remove from left list if present
         bot_data["left_members"] = [
             u for u in bot_data["left_members"] if u != uid_str
         ]
@@ -712,26 +753,28 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bot_data["stats"]["total_accepted"] += 1
 
         save_data(bot_data)
-        await safe_send(ctx, user.id, fmt_welcome_msg(user.first_name or "there"))
+        await safe_send(ctx, user.id, fmt_welcome_msg(first_name))
+        return
 
     # ── LEFT / KICKED ────────────────────────────────────
-    elif old_status in ACTIVE_STATUSES and new_status in LEFT_STATUSES:
-        bot_data["members"] = [
-            u for u in bot_data["members"] if u != uid_str
-        ]
+    if old_is_active and new_is_left:
+        bot_data["members"] = [u for u in bot_data["members"] if u != uid_str]
         if uid_str not in bot_data["left_members"]:
             bot_data["left_members"].append(uid_str)
         bot_data["stats"]["total_left"] += 1
         save_data(bot_data)
 
-        await safe_send(ctx, user.id, fmt_left_msg(user.first_name or "there"))
+        sent = await safe_send(ctx, user.id, fmt_left_msg(first_name))
         await notify_admins(
             ctx,
             f"{E_RED} <b>Member Left</b>\n\n"
-            f"{E_EYES} {user.first_name} "
+            f"{E_EYES} {first_name} "
             f"({'@' + user.username if user.username else 'no username'})\n"
-            f"{E_INFO} ID: <code>{user.id}</code>",
+            f"{E_INFO} ID: <code>{user.id}</code>\n"
+            f"{E_MAIL} Leave DM: <b>{'Sent' if sent else 'Failed'}</b>\n\n"
+            f"{E_WARN} If DM failed, the user has not started the bot or blocked it.",
         )
+        return
 
 
 # ═══════════════════════════════════════════════════════
@@ -1450,7 +1493,8 @@ async def _fwd_test(q, ctx):
 # ═══════════════════════════════════════════════════════
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text.strip()
+    text = (update.message.text or "").strip()
+    html_text = get_message_html_for_admin_panel(update.message).strip()
 
     # /cancel always works
     if text.lower() == "/cancel":
@@ -1604,7 +1648,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         key = key_map.get(msg_type)
         if key:
-            bot_data["settings"][key] = text
+            # Store Telegram HTML when entities exist so premium animated emojis
+            # remain exactly as copied and pasted from the admin panel.
+            bot_data["settings"][key] = html_text
             save_data(bot_data)
         ctx.user_data.pop("awaiting", None)
         await update.message.reply_text(
@@ -1631,7 +1677,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for uid_str in members:
             try:
                 await ctx.bot.send_message(
-                    int(uid_str), text, parse_mode=ParseMode.HTML
+                    int(uid_str), html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
                 )
                 ok += 1
             except TelegramError as e:
@@ -1644,7 +1690,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         bot_data["broadcast_history"].append({
             "date":    datetime.now().isoformat(),
-            "snippet": text[:80],
+            "snippet": html_text[:80],
             "ok":      ok,
             "fail":    fail,
             "blocked": blocked,
