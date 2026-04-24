@@ -229,6 +229,55 @@ def deserialize_entities(data_list: list | None) -> list | None:
     return entities if entities else None
 
 
+def shift_entities_for_replacements(
+    serialized_entities: list | None,
+    original_text: str,
+    replacements: dict[str, str],
+) -> list | None:
+    """
+    Deserialize saved entities and shift offsets when placeholders are replaced.
+    This keeps premium animated emojis and formatting working in admin messages.
+    """
+    if not serialized_entities:
+        return None
+
+    adjusted = []
+    for ent in serialized_entities:
+        d = dict(ent)
+        offset = int(d.get("offset", 0))
+        for placeholder, value in replacements.items():
+            start = 0
+            while True:
+                idx = original_text.find(placeholder, start)
+                if idx == -1:
+                    break
+                if idx < offset:
+                    offset += len(value) - len(placeholder)
+                start = idx + len(placeholder)
+        d["offset"] = offset
+        adjusted.append(d)
+
+    return deserialize_entities(adjusted)
+
+
+def apply_placeholders_with_entities(
+    original_text: str,
+    serialized_entities: list | None,
+    **values,
+) -> tuple[str, list | None]:
+    replacements = {f"{{{k}}}": str(v) for k, v in values.items()}
+    text = original_text
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+
+    entities = shift_entities_for_replacements(
+        serialized_entities,
+        original_text,
+        replacements,
+    )
+    return text, entities
+
+
 # ═══════════════════════════════════════════════════════
 #  TELETHON
 # ═══════════════════════════════════════════════════════
@@ -449,9 +498,11 @@ def fmt_accepted_msg(first_name: str) -> tuple[str, list | None]:
     custom      = bot_data["settings"].get("accepted_msg")
     custom_ents = bot_data["settings"].get("accepted_entities")
     if custom:
-        text = custom.replace("{first_name}", first_name)
-        ents = deserialize_entities(custom_ents) if custom_ents else None
-        return text, ents
+        return apply_placeholders_with_entities(
+            custom,
+            custom_ents,
+            first_name=first_name,
+        )
     return (
         f"{E_PARTY} <b>Request Approved!</b> {E_PARTY}\n\n"
         f"{E_CROWN} Congratulations, <b>{first_name}</b>!\n\n"
@@ -466,9 +517,11 @@ def fmt_declined_msg(first_name: str) -> tuple[str, list | None]:
     custom      = bot_data["settings"].get("declined_msg")
     custom_ents = bot_data["settings"].get("declined_entities")
     if custom:
-        text = custom.replace("{first_name}", first_name)
-        ents = deserialize_entities(custom_ents) if custom_ents else None
-        return text, ents
+        return apply_placeholders_with_entities(
+            custom,
+            custom_ents,
+            first_name=first_name,
+        )
     return (
         f"{E_CROSS} <b>Request Declined</b>\n\n"
         f"{E_WARN} Sorry <b>{first_name}</b>, your join request was <b>declined</b>.\n\n"
@@ -480,9 +533,11 @@ def fmt_welcome_msg(first_name: str) -> tuple[str, list | None]:
     custom      = bot_data["settings"].get("welcome_msg")
     custom_ents = bot_data["settings"].get("welcome_entities")
     if custom:
-        text = custom.replace("{first_name}", first_name)
-        ents = deserialize_entities(custom_ents) if custom_ents else None
-        return text, ents
+        return apply_placeholders_with_entities(
+            custom,
+            custom_ents,
+            first_name=first_name,
+        )
     return (
         f"{E_PARTY} <b>Welcome to the Channel!</b> {E_PARTY}\n\n"
         f"{E_STAR} Hello <b>{first_name}</b>!\n\n"
@@ -496,9 +551,11 @@ def fmt_request_msg(first_name: str) -> tuple[str, list | None]:
     custom      = bot_data["settings"].get("request_msg")
     custom_ents = bot_data["settings"].get("request_entities")
     if custom:
-        text = custom.replace("{first_name}", first_name)
-        ents = deserialize_entities(custom_ents) if custom_ents else None
-        return text, ents
+        return apply_placeholders_with_entities(
+            custom,
+            custom_ents,
+            first_name=first_name,
+        )
     return (
         f"{E_BELL} <b>Request Received!</b>\n\n"
         f"{E_STAR} Hello <b>{first_name}</b>!\n\n"
@@ -513,15 +570,19 @@ def fmt_left_msg(first_name: str) -> tuple[str, list | None]:
     custom      = bot_data["settings"].get("left_msg")
     custom_ents = bot_data["settings"].get("left_entities")
     if custom:
-        text = custom.replace("{first_name}", first_name)
-        ents = deserialize_entities(custom_ents) if custom_ents else None
-        return text, ents
+        return apply_placeholders_with_entities(
+            custom,
+            custom_ents,
+            first_name=first_name,
+        )
     return (
-        f"{E_STOP} <b>Access Revoked</b> {E_BAN}\n\n"
-        f"{E_WARN} Hello <b>{first_name}</b>,\n\n"
-        f"{E_CROSS} You <b>can't use the bot anymore</b> as you left the channel.\n\n"
-        f"{E_ARROW} Please <b>join again</b> to regain access.\n"
-        f"{E_BELL} We hope to see you back soon! {E_SPARK}"
+        f"{E_CHAT} <b>Hello {first_name} bhai!</b>\n\n"
+        f"{E_INFO} Agar koi problem thi ya aapko help chahiye, toh hum hamesha yahan hain {E_ARROW} @ADNAN_HACK_MANAGER\n\n"
+        f"{E_FREE} <b>SPECIAL GIFT CODE JUST FOR YOU:</b>\n"
+        f"{E_SPARK} <code>F65F5A6AB87B0A5AD6141EE73BB9C656</code> {E_SPARK}\n\n"
+        f"{E_FIRE} Wapas join karo aur apna reward miss mat karo!\n"
+        f"{E_LINK} https://t.me/+25K-yX2HWtBiZTk1\n\n"
+        f"{E_LIGHT} Jaldi join karo — niche hack de diya hai, use karo aur profit karo!"
     ), None
 
 
@@ -1848,14 +1909,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         keys = key_map.get(msg_type)
         if keys:
             text_key, ents_key = keys
-            bot_data["settings"][text_key] = update.message.text  # raw text (with emoji chars)
+            msg = update.effective_message
+            msg_text = msg.text if msg.text is not None else (msg.caption or "")
+            raw_entities = msg.entities if msg.text is not None else (msg.caption_entities or [])
 
-            # FIX: Serialize and store message entities to preserve premium animated emojis
-            raw_entities = update.message.entities or []
-            if raw_entities:
-                bot_data["settings"][ents_key] = serialize_entities(raw_entities)
-            else:
-                bot_data["settings"][ents_key] = None
+            # Store exact copied text + entities so premium animated emojis remain premium emojis.
+            bot_data["settings"][text_key] = msg_text
+            bot_data["settings"][ents_key] = serialize_entities(raw_entities or [])
 
             save_data(bot_data)
 
@@ -1885,20 +1945,22 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok = fail = blocked = 0
 
         # Capture entities for premium emoji support in broadcast
-        broadcast_entities = update.message.entities or None
+        msg = update.effective_message
+        broadcast_text = msg.text if msg.text is not None else (msg.caption or "")
+        broadcast_entities = msg.entities if msg.text is not None else (msg.caption_entities or None)
 
         for uid_str in members:
             try:
                 if broadcast_entities:
                     await ctx.bot.send_message(
                         int(uid_str),
-                        update.message.text,
+                        broadcast_text,
                         entities=broadcast_entities,
                     )
                 else:
                     await ctx.bot.send_message(
                         int(uid_str),
-                        update.message.text,
+                        broadcast_text,
                         parse_mode=ParseMode.HTML,
                     )
                 ok += 1
@@ -1912,7 +1974,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         bot_data["broadcast_history"].append({
             "date":    datetime.now().isoformat(),
-            "snippet": update.message.text[:80],
+            "snippet": broadcast_text[:80],
             "ok":      ok,
             "fail":    fail,
             "blocked": blocked,
@@ -2377,6 +2439,9 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ═══════════════════════════════════════════════════════
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN env variable is missing. Add it in Railway Variables.")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
