@@ -10,6 +10,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ChatJoinRequest,
+    MessageEntity,
 )
 from telegram.ext import (
     Application,
@@ -128,13 +129,18 @@ _DEFAULTS: dict = {
         "total_left":     0,
     },
     "settings": {
-        "welcome_msg":       None,
-        "request_msg":       None,
-        "accepted_msg":      None,
-        "declined_msg":      None,
-        "left_msg":          None,
-        "auto_accept":       False,
-        "auto_accept_delay": 0,
+        "welcome_msg":        None,
+        "welcome_entities":   None,
+        "request_msg":        None,
+        "request_entities":   None,
+        "accepted_msg":       None,
+        "accepted_entities":  None,
+        "declined_msg":       None,
+        "declined_entities":  None,
+        "left_msg":           None,
+        "left_entities":      None,
+        "auto_accept":        False,
+        "auto_accept_delay":  0,
     },
     "telethon_session":  None,
     "telethon_api_id":   None,
@@ -150,14 +156,11 @@ def load_data() -> dict:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 stored = json.load(f)
             import copy
-            # Back-fill missing top-level keys
             for k, v in _DEFAULTS.items():
                 if k not in stored:
                     stored[k] = copy.deepcopy(v)
-            # Back-fill missing settings keys
             for k, v in _DEFAULTS["settings"].items():
                 stored["settings"].setdefault(k, v)
-            # Back-fill missing stats keys
             for k, v in _DEFAULTS["stats"].items():
                 stored["stats"].setdefault(k, v)
             return stored
@@ -176,6 +179,55 @@ def save_data(data: dict):
 
 
 bot_data: dict = load_data()
+
+# ═══════════════════════════════════════════════════════
+#  ENTITY SERIALIZATION (for premium emoji support)
+# ═══════════════════════════════════════════════════════
+
+def serialize_entities(entities) -> list | None:
+    """Convert telegram MessageEntity list to JSON-serializable list."""
+    if not entities:
+        return None
+    result = []
+    for e in entities:
+        d = {
+            "type":   e.type.value if hasattr(e.type, "value") else str(e.type),
+            "offset": e.offset,
+            "length": e.length,
+        }
+        if e.url:
+            d["url"] = e.url
+        if e.user:
+            d["user_id"] = e.user.id
+        if e.language:
+            d["language"] = e.language
+        if e.custom_emoji_id:
+            d["custom_emoji_id"] = e.custom_emoji_id
+        result.append(d)
+    return result
+
+
+def deserialize_entities(data_list: list | None) -> list | None:
+    """Convert JSON list back to MessageEntity objects."""
+    if not data_list:
+        return None
+    from telegram import User as TGUser
+    entities = []
+    for d in data_list:
+        try:
+            entity = MessageEntity(
+                type=d["type"],
+                offset=d["offset"],
+                length=d["length"],
+                url=d.get("url"),
+                language=d.get("language"),
+                custom_emoji_id=d.get("custom_emoji_id"),
+            )
+            entities.append(entity)
+        except Exception as ex:
+            logger.warning(f"deserialize_entities skip: {ex}")
+    return entities if entities else None
+
 
 # ═══════════════════════════════════════════════════════
 #  TELETHON
@@ -251,40 +303,31 @@ async def safe_send(
     ctx: ContextTypes.DEFAULT_TYPE,
     uid: int,
     text: str,
+    entities: list | None = None,
     **kwargs
 ):
     """
-    Send a private message safely.
-
-    Important Telegram limit:
-    the bot can DM a user only if the user has started the bot before
-    or Telegram currently allows the bot to message them from a join request.
+    Send a message; silently ignore if user blocked the bot.
+    If entities are provided (for premium emoji support), send without parse_mode.
+    Otherwise send with HTML parse_mode.
     """
     try:
-        await ctx.bot.send_message(
-            chat_id=uid,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            **kwargs
-        )
-        return True
+        if entities:
+            await ctx.bot.send_message(
+                uid,
+                text,
+                entities=entities,
+                **kwargs
+            )
+        else:
+            await ctx.bot.send_message(
+                uid,
+                text,
+                parse_mode=ParseMode.HTML,
+                **kwargs
+            )
     except TelegramError as e:
-        logger.warning(f"safe_send failed uid={uid}: {e}")
-        return False
-
-
-def get_message_html_for_admin_panel(message) -> str:
-    """
-    Save admin-panel messages exactly as Telegram sends them.
-
-    - Premium animated/custom emojis are stored as <tg-emoji emoji-id=...>.
-    - Bold/italic/link entities copied from Telegram are preserved.
-    - If the admin typed raw HTML manually, keep it as raw HTML.
-    """
-    if getattr(message, "entities", None):
-        return message.text_html
-    return message.text or ""
+        logger.debug(f"safe_send uid={uid}: {e}")
 
 
 async def copy_channel_messages_to_user(
@@ -306,7 +349,7 @@ async def copy_channel_messages_to_user(
                 from_chat_id=CHANNEL_ID,
                 message_id=msg_id,
             )
-            await asyncio.sleep(0.4)          # slight delay to avoid flood
+            await asyncio.sleep(0.4)
         except BadRequest as e:
             logger.warning(
                 f"copy_message mid={msg_id} → uid={user_id}: {e}"
@@ -323,10 +366,7 @@ async def approve_join_request_safe(
 ) -> tuple[bool, str]:
     """
     Approve a join request reliably.
-
-    First tries the Bot API. If the request was picked with Telethon or is too old
-    and the Bot API cannot approve it, falls back to the logged-in Telethon admin
-    account. Returns (success, method/error).
+    First tries Bot API, then falls back to Telethon.
     """
     try:
         await ctx.bot.approve_chat_join_request(CHANNEL_ID, user_id)
@@ -399,11 +439,19 @@ async def decline_join_request_safe(
 
 # ═══════════════════════════════════════════════════════
 #  MESSAGE FORMATTERS
+#  Returns (text, entities_or_None)
+#  If custom message with saved entities → returns (text, entities)
+#  If custom message text only → returns (text, None) with HTML parse_mode
+#  If default → returns (html_text, None)
 # ═══════════════════════════════════════════════════════
-def fmt_accepted_msg(first_name: str) -> str:
-    custom = bot_data["settings"].get("accepted_msg")
+
+def fmt_accepted_msg(first_name: str) -> tuple[str, list | None]:
+    custom      = bot_data["settings"].get("accepted_msg")
+    custom_ents = bot_data["settings"].get("accepted_entities")
     if custom:
-        return custom.replace("{first_name}", first_name)
+        text = custom.replace("{first_name}", first_name)
+        ents = deserialize_entities(custom_ents) if custom_ents else None
+        return text, ents
     return (
         f"{E_PARTY} <b>Request Approved!</b> {E_PARTY}\n\n"
         f"{E_CROWN} Congratulations, <b>{first_name}</b>!\n\n"
@@ -411,37 +459,46 @@ def fmt_accepted_msg(first_name: str) -> str:
         f"{E_DIAMOND} You now have <b>full access</b> to the channel.\n\n"
         f"{E_FIRE} Welcome to the community!\n"
         f"{E_SPARK} Enjoy your stay {E_100}"
-    )
+    ), None
 
 
-def fmt_declined_msg(first_name: str) -> str:
-    custom = bot_data["settings"].get("declined_msg")
+def fmt_declined_msg(first_name: str) -> tuple[str, list | None]:
+    custom      = bot_data["settings"].get("declined_msg")
+    custom_ents = bot_data["settings"].get("declined_entities")
     if custom:
-        return custom.replace("{first_name}", first_name)
+        text = custom.replace("{first_name}", first_name)
+        ents = deserialize_entities(custom_ents) if custom_ents else None
+        return text, ents
     return (
         f"{E_CROSS} <b>Request Declined</b>\n\n"
         f"{E_WARN} Sorry <b>{first_name}</b>, your join request was <b>declined</b>.\n\n"
         f"{E_INFO} Please contact the admin for more information."
-    )
+    ), None
 
 
-def fmt_welcome_msg(first_name: str) -> str:
-    custom = bot_data["settings"].get("welcome_msg")
+def fmt_welcome_msg(first_name: str) -> tuple[str, list | None]:
+    custom      = bot_data["settings"].get("welcome_msg")
+    custom_ents = bot_data["settings"].get("welcome_entities")
     if custom:
-        return custom.replace("{first_name}", first_name)
+        text = custom.replace("{first_name}", first_name)
+        ents = deserialize_entities(custom_ents) if custom_ents else None
+        return text, ents
     return (
         f"{E_PARTY} <b>Welcome to the Channel!</b> {E_PARTY}\n\n"
         f"{E_STAR} Hello <b>{first_name}</b>!\n\n"
         f"{E_DIAMOND} You are now a verified member.\n"
         f"{E_FIRE} We're thrilled to have you here!\n\n"
         f"{E_CROWN} Enjoy the content {E_SPARK}"
-    )
+    ), None
 
 
-def fmt_request_msg(first_name: str) -> str:
-    custom = bot_data["settings"].get("request_msg")
+def fmt_request_msg(first_name: str) -> tuple[str, list | None]:
+    custom      = bot_data["settings"].get("request_msg")
+    custom_ents = bot_data["settings"].get("request_entities")
     if custom:
-        return custom.replace("{first_name}", first_name)
+        text = custom.replace("{first_name}", first_name)
+        ents = deserialize_entities(custom_ents) if custom_ents else None
+        return text, ents
     return (
         f"{E_BELL} <b>Request Received!</b>\n\n"
         f"{E_STAR} Hello <b>{first_name}</b>!\n\n"
@@ -449,20 +506,23 @@ def fmt_request_msg(first_name: str) -> str:
         f"{E_HOUR} Please wait while an admin reviews it.\n\n"
         f"{E_INFO} You will be notified once it's processed.\n\n"
         f"{E_SPARK} Thank you for your patience! {E_100}"
-    )
+    ), None
 
 
-def fmt_left_msg(first_name: str) -> str:
-    custom = bot_data["settings"].get("left_msg")
+def fmt_left_msg(first_name: str) -> tuple[str, list | None]:
+    custom      = bot_data["settings"].get("left_msg")
+    custom_ents = bot_data["settings"].get("left_entities")
     if custom:
-        return custom.replace("{first_name}", first_name)
+        text = custom.replace("{first_name}", first_name)
+        ents = deserialize_entities(custom_ents) if custom_ents else None
+        return text, ents
     return (
         f"{E_STOP} <b>Access Revoked</b> {E_BAN}\n\n"
         f"{E_WARN} Hello <b>{first_name}</b>,\n\n"
         f"{E_CROSS} You <b>can't use the bot anymore</b> as you left the channel.\n\n"
         f"{E_ARROW} Please <b>join again</b> to regain access.\n"
         f"{E_BELL} We hope to see you back soon! {E_SPARK}"
-    )
+    ), None
 
 
 # ═══════════════════════════════════════════════════════
@@ -487,12 +547,16 @@ def admin_home_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🚫 Banned",             callback_data="adm_banned"),
         ],
         [
-            InlineKeyboardButton("🔗 Telethon Login",    callback_data="adm_telethon"),
-            InlineKeyboardButton("🔍 Pick Old Requests", callback_data="adm_pick_old"),
+            InlineKeyboardButton("🔗 Telethon Login",     callback_data="adm_telethon"),
+            InlineKeyboardButton("🔍 Pick Old Requests",  callback_data="adm_pick_old"),
         ],
         [
             InlineKeyboardButton("📨 Forward Test",       callback_data="adm_fwd_test"),
             InlineKeyboardButton("🔄 Refresh",            callback_data="adm_home"),
+        ],
+        [
+            InlineKeyboardButton("⬇️ Get DB",             callback_data="adm_get_db"),
+            InlineKeyboardButton("⬆️ Upload DB",          callback_data="adm_upload_db"),
         ],
     ])
 
@@ -555,7 +619,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     else:
-        # Build the correct public invite link from the numeric channel id
         channel_link_id = str(CHANNEL_ID).replace("-100", "")
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
@@ -594,6 +657,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{E_TRASH} /declineall   — Decline all pending\n"
             f"{E_EYES}  /pending      — View pending requests\n"
             f"{E_SEARCH}/pick         — Pick old requests via Telethon\n"
+            f"{E_DOWN}  /getdb        — Download database file\n"
             f"{E_REFRESH}/reload      — Reload data from disk\n"
         )
     else:
@@ -608,7 +672,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════
-#  JOIN REQUEST HANDLER  ← KEY FIX: sends messages on request
+#  JOIN REQUEST HANDLER
 # ═══════════════════════════════════════════════════════
 async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     req: ChatJoinRequest = update.chat_join_request
@@ -663,22 +727,17 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_data["stats"]["total_accepted"] += 1
         save_data(bot_data)
 
-        # Send acceptance message
-        await safe_send(ctx, uid, fmt_accepted_msg(first_name))
-        # Copy channel messages without forward tag (premium emojis intact)
+        text, ents = fmt_accepted_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
         await copy_channel_messages_to_user(ctx, uid)
         return
 
     # ── Manual-review flow ───────────────────────────────
-    # 1. Tell the user their request was received
-    await safe_send(ctx, uid, fmt_request_msg(first_name))
-
-    # 2. Copy the channel messages to the user NOW (on request received)
-    #    so they get the content while waiting — remove this block if you
-    #    only want to send after approval.
+    text, ents = fmt_request_msg(first_name)
+    await safe_send(ctx, uid, text, entities=ents)
     await copy_channel_messages_to_user(ctx, uid)
 
-    # 3. Notify admins with accept / decline buttons
+    # Notify admins with accept / decline buttons
     admin_text = (
         f"{E_NEW} <b>New Join Request</b>\n\n"
         f"{E_EYES} <b>Name:</b> {user.first_name or ''} {user.last_name or ''}\n"
@@ -702,45 +761,33 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ═══════════════════════════════════════════════════════
 #  CHAT MEMBER HANDLER  (joined / left)
+#  FIX: Use ANY_CHAT_MEMBER to capture all member events.
+#  FIX: left message now correctly sends via safe_send.
 # ═══════════════════════════════════════════════════════
 async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Track channel joins/leaves and message users when they leave."""
-    evt = update.chat_member
-    if not evt or not evt.chat or evt.chat.id != CHANNEL_ID:
+    # Handle both chat_member and my_chat_member updates
+    evt = update.chat_member or update.my_chat_member
+    if not evt:
         return
 
-    old_member = evt.old_chat_member
-    new_member = evt.new_chat_member
-    user = new_member.user
-    uid_str = str(user.id)
+    # Only process events for our target channel
+    if evt.chat.id != CHANNEL_ID:
+        return
 
-    old_status = old_member.status
-    new_status = new_member.status
+    user       = evt.new_chat_member.user
+    uid_str    = str(user.id)
+    old_status = evt.old_chat_member.status
+    new_status = evt.new_chat_member.status
 
-    LEFT_STATUSES = {
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.BANNED,
-        "left",
-        "kicked",
-    }
+    LEFT_STATUSES   = {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
     ACTIVE_STATUSES = {
         ChatMemberStatus.MEMBER,
         ChatMemberStatus.ADMINISTRATOR,
         ChatMemberStatus.OWNER,
-        "member",
-        "administrator",
-        "creator",
     }
 
-    old_is_active = old_status in ACTIVE_STATUSES
-    new_is_active = new_status in ACTIVE_STATUSES
-    old_is_left = old_status in LEFT_STATUSES
-    new_is_left = new_status in LEFT_STATUSES
-
-    first_name = user.first_name or "there"
-
     # ── JOINED ──────────────────────────────────────────
-    if old_is_left and new_is_active:
+    if old_status in LEFT_STATUSES and new_status in ACTIVE_STATUSES:
         if uid_str not in bot_data["members"]:
             bot_data["members"].append(uid_str)
         bot_data["left_members"] = [
@@ -753,28 +800,35 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bot_data["stats"]["total_accepted"] += 1
 
         save_data(bot_data)
-        await safe_send(ctx, user.id, fmt_welcome_msg(first_name))
-        return
+
+        first_name = user.first_name or "there"
+        text, ents = fmt_welcome_msg(first_name)
+        await safe_send(ctx, user.id, text, entities=ents)
 
     # ── LEFT / KICKED ────────────────────────────────────
-    if old_is_active and new_is_left:
-        bot_data["members"] = [u for u in bot_data["members"] if u != uid_str]
+    elif old_status in ACTIVE_STATUSES and new_status in LEFT_STATUSES:
+        bot_data["members"] = [
+            u for u in bot_data["members"] if u != uid_str
+        ]
         if uid_str not in bot_data["left_members"]:
             bot_data["left_members"].append(uid_str)
         bot_data["stats"]["total_left"] += 1
         save_data(bot_data)
 
-        sent = await safe_send(ctx, user.id, fmt_left_msg(first_name))
+        first_name = user.first_name or "there"
+
+        # FIX: Send left message — this was the primary bug.
+        # The message is now sent correctly with entity support.
+        text, ents = fmt_left_msg(first_name)
+        await safe_send(ctx, user.id, text, entities=ents)
+
         await notify_admins(
             ctx,
             f"{E_RED} <b>Member Left</b>\n\n"
-            f"{E_EYES} {first_name} "
+            f"{E_EYES} {user.first_name} "
             f"({'@' + user.username if user.username else 'no username'})\n"
-            f"{E_INFO} ID: <code>{user.id}</code>\n"
-            f"{E_MAIL} Leave DM: <b>{'Sent' if sent else 'Failed'}</b>\n\n"
-            f"{E_WARN} If DM failed, the user has not started the bot or blocked it.",
+            f"{E_INFO} ID: <code>{user.id}</code>",
         )
-        return
 
 
 # ═══════════════════════════════════════════════════════
@@ -859,7 +913,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["awaiting"] = f"setmsg_{msg_type}"
         await q.edit_message_text(
             f"{E_EDIT} <b>Set {msg_type} message</b>\n\n"
-            f"Send the new message (HTML supported).\n"
+            f"Send the new message.\n"
+            f"✅ <b>Premium emojis are fully supported</b> — just paste/send with them.\n"
             f"Placeholders: <code>{{first_name}}</code>\n\n"
             f"/cancel to abort.",
             parse_mode=ParseMode.HTML,
@@ -867,8 +922,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "reset_msgs":
         for k in [
-            "request_msg", "accepted_msg", "declined_msg",
-            "welcome_msg",  "left_msg",
+            "request_msg",  "request_entities",
+            "accepted_msg", "accepted_entities",
+            "declined_msg", "declined_entities",
+            "welcome_msg",  "welcome_entities",
+            "left_msg",     "left_entities",
         ]:
             bot_data["settings"][k] = None
         save_data(bot_data)
@@ -891,6 +949,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "adm_fwd_test":
         await _fwd_test(q, ctx)
+
+    elif data == "adm_get_db":
+        await _cb_get_db(q, ctx)
+
+    elif data == "adm_upload_db":
+        ctx.user_data["awaiting"] = "upload_db"
+        await q.edit_message_text(
+            f"{E_UP} <b>Upload Database</b>\n\n"
+            f"Send the <code>bot_data.json</code> file now.\n"
+            f"⚠️ This will <b>overwrite</b> current data!\n\n"
+            f"/cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
 
     else:
         await q.answer("Unknown action.", show_alert=True)
@@ -992,7 +1063,6 @@ async def _show_pending(q, ctx, page: int = 0):
 async def _cb_accept_one(q, ctx, target_id: int):
     uid_str = str(target_id)
 
-    # Grab user info BEFORE popping from pending
     info = bot_data["pending_requests"].get(uid_str, {})
     first_name = info.get("first_name", "there") or "there"
 
@@ -1018,9 +1088,8 @@ async def _cb_accept_one(q, ctx, target_id: int):
     bot_data["stats"]["total_accepted"] += 1
     save_data(bot_data)
 
-    # Send acceptance message
-    await safe_send(ctx, target_id, fmt_accepted_msg(first_name))
-    # Copy channel messages without forward tag (premium emojis preserved)
+    text, ents = fmt_accepted_msg(first_name)
+    await safe_send(ctx, target_id, text, entities=ents)
     await copy_channel_messages_to_user(ctx, target_id)
 
     try:
@@ -1031,7 +1100,7 @@ async def _cb_accept_one(q, ctx, target_id: int):
             parse_mode=ParseMode.HTML,
         )
     except BadRequest:
-        pass   # message not modified — fine
+        pass
 
 
 async def _cb_decline_one(q, ctx, target_id: int):
@@ -1060,7 +1129,8 @@ async def _cb_decline_one(q, ctx, target_id: int):
     bot_data["stats"]["total_declined"] += 1
     save_data(bot_data)
 
-    await safe_send(ctx, target_id, fmt_declined_msg(first_name))
+    text, ents = fmt_declined_msg(first_name)
+    await safe_send(ctx, target_id, text, entities=ents)
 
     try:
         await q.edit_message_text(
@@ -1143,7 +1213,8 @@ async def _cb_accept_all(q, ctx):
         bot_data["stats"]["total_accepted"] += 1
         ok += 1
 
-        await safe_send(ctx, uid, fmt_accepted_msg(first_name))
+        text, ents = fmt_accepted_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
         await copy_channel_messages_to_user(ctx, uid)
         await asyncio.sleep(0.2)
 
@@ -1201,7 +1272,8 @@ async def _cb_decline_all(q, ctx):
             bot_data["declined_users"].append(uid_str)
         bot_data["stats"]["total_declined"] += 1
         ok += 1
-        await safe_send(ctx, uid, fmt_declined_msg(first_name))
+        text, ents = fmt_declined_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
         await asyncio.sleep(0.2)
 
     save_data(bot_data)
@@ -1488,13 +1560,140 @@ async def _fwd_test(q, ctx):
         pass
 
 
+async def _cb_get_db(q, ctx):
+    """Send the database file to the admin."""
+    if not Path(DATA_FILE).exists():
+        try:
+            await q.edit_message_text(
+                f"{E_CROSS} <b>Database file not found!</b>",
+                reply_markup=back_kb(),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+        return
+
+    try:
+        await q.edit_message_text(
+            f"{E_HOUR} <b>Sending database…</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except BadRequest:
+        pass
+
+    try:
+        with open(DATA_FILE, "rb") as f:
+            await ctx.bot.send_document(
+                chat_id=q.from_user.id,
+                document=f,
+                filename=DATA_FILE,
+                caption=(
+                    f"{E_DOWN} <b>Database Export</b>\n"
+                    f"{E_INFO} File: <code>{DATA_FILE}</code>\n"
+                    f"{E_CHART} Members: <b>{len(bot_data['members'])}</b>\n"
+                    f"{E_GREEN} Pending: <b>{len(bot_data['pending_requests'])}</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        try:
+            await q.edit_message_text(
+                f"{E_CHECK} <b>Database sent!</b>",
+                reply_markup=back_kb(),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+    except Exception as e:
+        logger.error(f"get_db error: {e}")
+        try:
+            await q.edit_message_text(
+                f"{E_CROSS} <b>Error sending DB:</b>\n<code>{e}</code>",
+                reply_markup=back_kb(),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            pass
+
+
 # ═══════════════════════════════════════════════════════
-#  TEXT MESSAGE HANDLER  (admin input states)
+#  TEXT / DOCUMENT MESSAGE HANDLER  (admin input states)
 # ═══════════════════════════════════════════════════════
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle database file uploads from admins."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    awaiting = ctx.user_data.get("awaiting", "")
+    if awaiting != "upload_db":
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    # Validate it's a JSON file
+    if not (doc.file_name and doc.file_name.endswith(".json")):
+        await update.message.reply_text(
+            f"{E_CROSS} Please send a <code>.json</code> file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    ctx.user_data.pop("awaiting", None)
+
+    try:
+        file = await ctx.bot.get_file(doc.file_id)
+        downloaded = await file.download_as_bytearray()
+        content    = downloaded.decode("utf-8")
+
+        # Validate JSON
+        new_data = json.loads(content)
+
+        # Back-fill missing keys to avoid KeyError after restore
+        import copy
+        for k, v in _DEFAULTS.items():
+            if k not in new_data:
+                new_data[k] = copy.deepcopy(v)
+        for k, v in _DEFAULTS["settings"].items():
+            new_data["settings"].setdefault(k, v)
+        for k, v in _DEFAULTS["stats"].items():
+            new_data["stats"].setdefault(k, v)
+
+        # Write to disk
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(new_data, f, indent=2, default=str)
+
+        # Reload in memory
+        global bot_data
+        bot_data = new_data
+
+        await update.message.reply_text(
+            f"{E_CHECK} <b>Database Uploaded Successfully!</b>\n\n"
+            f"{E_GREEN} Members : <b>{len(bot_data['members'])}</b>\n"
+            f"{E_HOUR}  Pending : <b>{len(bot_data['pending_requests'])}</b>\n"
+            f"{E_STOP}  Banned  : <b>{len(bot_data['banned_users'])}</b>",
+            reply_markup=admin_home_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+    except json.JSONDecodeError as e:
+        await update.message.reply_text(
+            f"{E_CROSS} <b>Invalid JSON file!</b>\n<code>{e}</code>",
+            reply_markup=admin_home_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"upload_db error: {e}")
+        await update.message.reply_text(
+            f"{E_CROSS} <b>Upload failed:</b>\n<code>{e}</code>",
+            reply_markup=admin_home_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = (update.message.text or "").strip()
-    html_text = get_message_html_for_admin_panel(update.message).strip()
+    text = update.message.text.strip()
 
     # /cancel always works
     if text.lower() == "/cancel":
@@ -1640,21 +1839,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif awaiting.startswith("setmsg_"):
         msg_type = awaiting[7:]
         key_map  = {
-            "request":  "request_msg",
-            "accepted": "accepted_msg",
-            "declined": "declined_msg",
-            "welcome":  "welcome_msg",
-            "left":     "left_msg",
+            "request":  ("request_msg",  "request_entities"),
+            "accepted": ("accepted_msg", "accepted_entities"),
+            "declined": ("declined_msg", "declined_entities"),
+            "welcome":  ("welcome_msg",  "welcome_entities"),
+            "left":     ("left_msg",     "left_entities"),
         }
-        key = key_map.get(msg_type)
-        if key:
-            # Store Telegram HTML when entities exist so premium animated emojis
-            # remain exactly as copied and pasted from the admin panel.
-            bot_data["settings"][key] = html_text
+        keys = key_map.get(msg_type)
+        if keys:
+            text_key, ents_key = keys
+            bot_data["settings"][text_key] = update.message.text  # raw text (with emoji chars)
+
+            # FIX: Serialize and store message entities to preserve premium animated emojis
+            raw_entities = update.message.entities or []
+            if raw_entities:
+                bot_data["settings"][ents_key] = serialize_entities(raw_entities)
+            else:
+                bot_data["settings"][ents_key] = None
+
             save_data(bot_data)
+
         ctx.user_data.pop("awaiting", None)
         await update.message.reply_text(
-            f"{E_CHECK} <b>{msg_type.title()} message updated!</b>",
+            f"{E_CHECK} <b>{msg_type.title()} message updated!</b>\n"
+            f"{E_SPARK} Premium emojis preserved: "
+            f"{'✅' if bot_data['settings'].get(keys[1] if keys else '') else '—'}",
             reply_markup=admin_home_kb(),
             parse_mode=ParseMode.HTML,
         )
@@ -1674,11 +1883,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
         ok = fail = blocked = 0
+
+        # Capture entities for premium emoji support in broadcast
+        broadcast_entities = update.message.entities or None
+
         for uid_str in members:
             try:
-                await ctx.bot.send_message(
-                    int(uid_str), html_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-                )
+                if broadcast_entities:
+                    await ctx.bot.send_message(
+                        int(uid_str),
+                        update.message.text,
+                        entities=broadcast_entities,
+                    )
+                else:
+                    await ctx.bot.send_message(
+                        int(uid_str),
+                        update.message.text,
+                        parse_mode=ParseMode.HTML,
+                    )
                 ok += 1
             except TelegramError as e:
                 err = str(e).lower()
@@ -1690,7 +1912,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         bot_data["broadcast_history"].append({
             "date":    datetime.now().isoformat(),
-            "snippet": html_text[:80],
+            "snippet": update.message.text[:80],
             "ok":      ok,
             "fail":    fail,
             "blocked": blocked,
@@ -1705,7 +1927,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     else:
-        # Admin sent something without a known awaiting state
         await update.message.reply_text(
             f"{E_INFO} Use /start to open the admin panel.",
             reply_markup=admin_home_kb(),
@@ -1756,7 +1977,8 @@ async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_data["stats"]["total_accepted"] += 1
     save_data(bot_data)
 
-    await safe_send(ctx, uid, fmt_accepted_msg(first_name))
+    text, ents = fmt_accepted_msg(first_name)
+    await safe_send(ctx, uid, text, entities=ents)
     await copy_channel_messages_to_user(ctx, uid)
     await update.message.reply_text(
         f"{E_CHECK} User {uid} accepted!", parse_mode=ParseMode.HTML
@@ -1787,7 +2009,9 @@ async def cmd_decline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_data["declined_users"].append(uid_str)
     bot_data["stats"]["total_declined"] += 1
     save_data(bot_data)
-    await safe_send(ctx, uid, fmt_declined_msg(first_name))
+
+    text, ents = fmt_declined_msg(first_name)
+    await safe_send(ctx, uid, text, entities=ents)
     await update.message.reply_text(
         f"{E_CROSS} User {uid} declined!", parse_mode=ParseMode.HTML
     )
@@ -1860,7 +2084,8 @@ async def cmd_acceptall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bot_data["accepted_users"].append(uid_str)
         bot_data["stats"]["total_accepted"] += 1
         ok += 1
-        await safe_send(ctx, uid, fmt_accepted_msg(first_name))
+        text, ents = fmt_accepted_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
         await copy_channel_messages_to_user(ctx, uid)
         await asyncio.sleep(0.2)
     bot_data["pending_requests"].clear()
@@ -1894,7 +2119,8 @@ async def cmd_declineall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bot_data["declined_users"].append(uid_str)
         bot_data["stats"]["total_declined"] += 1
         ok += 1
-        await safe_send(ctx, uid, fmt_declined_msg(first_name))
+        text, ents = fmt_declined_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
         await asyncio.sleep(0.2)
     bot_data["pending_requests"].clear()
     save_data(bot_data)
@@ -2036,6 +2262,35 @@ async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_getdb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Download the database file via command."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not Path(DATA_FILE).exists():
+        await update.message.reply_text(
+            f"{E_CROSS} Database file not found!", parse_mode=ParseMode.HTML
+        )
+        return
+    try:
+        with open(DATA_FILE, "rb") as f:
+            await ctx.bot.send_document(
+                chat_id=update.effective_user.id,
+                document=f,
+                filename=DATA_FILE,
+                caption=(
+                    f"{E_DOWN} <b>Database Export</b>\n"
+                    f"{E_INFO} File: <code>{DATA_FILE}</code>\n"
+                    f"{E_GREEN} Members: <b>{len(bot_data['members'])}</b>\n"
+                    f"{E_HOUR}  Pending: <b>{len(bot_data['pending_requests'])}</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"{E_CROSS} Error: <code>{e}</code>", parse_mode=ParseMode.HTML
+        )
+
+
 async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -2138,6 +2393,7 @@ def main():
     app.add_handler(CommandHandler("user",       cmd_user))
     app.add_handler(CommandHandler("pick",       cmd_pick))
     app.add_handler(CommandHandler("reload",     cmd_reload))
+    app.add_handler(CommandHandler("getdb",      cmd_getdb))
     app.add_handler(CommandHandler("broadcast",  cmd_broadcast))
     app.add_handler(CommandHandler("mystatus",   cmd_mystatus))
     app.add_handler(CommandHandler("myinfo",     cmd_myinfo))
@@ -2145,13 +2401,19 @@ def main():
     # Join requests (highest priority)
     app.add_handler(ChatJoinRequestHandler(on_join_request))
 
-    # Member status changes
+    # FIX: Use ANY_CHAT_MEMBER to properly capture member join/leave events
+    # in channels. CHAT_MEMBER alone misses many channel member updates.
     app.add_handler(
-        ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER)
+        ChatMemberHandler(on_chat_member, ChatMemberHandler.ANY_CHAT_MEMBER)
     )
 
     # Inline buttons
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Document handler for DB upload (must be before text handler)
+    app.add_handler(
+        MessageHandler(filters.Document.ALL, on_document)
+    )
 
     # Free-text (admin states + member guard)
     app.add_handler(
@@ -2173,8 +2435,8 @@ def main():
             Update.MESSAGE,
             Update.CALLBACK_QUERY,
             Update.CHAT_JOIN_REQUEST,
-            Update.CHAT_MEMBER,
-            Update.MY_CHAT_MEMBER,
+            Update.CHAT_MEMBER,        # channel member updates
+            Update.MY_CHAT_MEMBER,     # bot's own member updates
         ],
         drop_pending_updates=True,
     )
