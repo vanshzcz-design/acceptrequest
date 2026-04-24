@@ -42,7 +42,7 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS        = [7353041224, 6527836651]
 ADMIN_ID         = ADMIN_IDS[0]
-CHANNEL_ID       = -1002701185142
+CHANNEL_ID       = -1002232875049
 DATA_FILE        = "bot_data.json"
 
 # Message IDs inside the channel to copy (no forward tag) to users
@@ -141,6 +141,7 @@ _DEFAULTS: dict = {
         "left_entities":      None,
         "auto_accept":        False,
         "auto_accept_delay":  0,
+        "activity_channel_id": CHANNEL_ID,
     },
     "telethon_session":  None,
     "telethon_api_id":   None,
@@ -179,6 +180,21 @@ def save_data(data: dict):
 
 
 bot_data: dict = load_data()
+
+
+def get_activity_channel_id() -> int:
+    """Return the channel ID used for all bot activities.
+    Admin can change this from Settings. Falls back to CHANNEL_ID.
+    """
+    try:
+        return int(bot_data.get("settings", {}).get("activity_channel_id") or CHANNEL_ID)
+    except Exception:
+        return int(CHANNEL_ID)
+
+
+def set_activity_channel_id(channel_id: int):
+    bot_data.setdefault("settings", {})["activity_channel_id"] = int(channel_id)
+    save_data(bot_data)
 
 # ═══════════════════════════════════════════════════════
 #  ENTITY SERIALIZATION (for premium emoji support)
@@ -338,7 +354,7 @@ async def notify_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
 
 async def is_member(uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        m = await ctx.bot.get_chat_member(CHANNEL_ID, uid)
+        m = await ctx.bot.get_chat_member(get_activity_channel_id(), uid)
         return m.status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
@@ -395,7 +411,7 @@ async def copy_channel_messages_to_user(
         try:
             await ctx.bot.copy_message(
                 chat_id=user_id,
-                from_chat_id=CHANNEL_ID,
+                from_chat_id=get_activity_channel_id(),
                 message_id=msg_id,
             )
             await asyncio.sleep(0.4)
@@ -418,7 +434,7 @@ async def approve_join_request_safe(
     First tries Bot API, then falls back to Telethon.
     """
     try:
-        await ctx.bot.approve_chat_join_request(CHANNEL_ID, user_id)
+        await ctx.bot.approve_chat_join_request(get_activity_channel_id(), user_id)
         return True, "bot_api"
     except BadRequest as e:
         bot_error = str(e)
@@ -433,7 +449,7 @@ async def approve_join_request_safe(
     client = await get_telethon_client()
     if client:
         try:
-            entity = await client.get_entity(CHANNEL_ID)
+            entity = await client.get_entity(get_activity_channel_id())
             await client(HideChatJoinRequestRequest(
                 peer=entity,
                 user_id=int(user_id),
@@ -456,7 +472,7 @@ async def decline_join_request_safe(
     Decline a join request reliably using Bot API, then Telethon fallback.
     """
     try:
-        await ctx.bot.decline_chat_join_request(CHANNEL_ID, user_id)
+        await ctx.bot.decline_chat_join_request(get_activity_channel_id(), user_id)
         return True, "bot_api"
     except BadRequest as e:
         bot_error = str(e)
@@ -471,7 +487,7 @@ async def decline_join_request_safe(
     client = await get_telethon_client()
     if client:
         try:
-            entity = await client.get_entity(CHANNEL_ID)
+            entity = await client.get_entity(get_activity_channel_id())
             await client(HideChatJoinRequestRequest(
                 peer=entity,
                 user_id=int(user_id),
@@ -680,7 +696,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
     else:
-        channel_link_id = str(CHANNEL_ID).replace("-100", "")
+        channel_link_id = str(get_activity_channel_id()).replace("-100", "")
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 "📢 Join Channel",
@@ -740,6 +756,11 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user    = req.from_user
     uid     = user.id
     uid_str = str(uid)
+
+    # Only process requests from the active/admin-set channel.
+    if req.chat.id != get_activity_channel_id():
+        logger.info(f"Ignored join request from non-active channel {req.chat.id}; active={get_activity_channel_id()}")
+        return
 
     # ── Banned → instant decline ─────────────────────────
     if uid_str in bot_data["banned_users"]:
@@ -831,8 +852,10 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not evt:
         return
 
-    # Only process events for our target channel
-    if evt.chat.id != CHANNEL_ID:
+    # Only process events for the active/admin-set channel.
+    active_channel_id = get_activity_channel_id()
+    if evt.chat.id != active_channel_id:
+        logger.info(f"Ignored chat_member update from channel {evt.chat.id}; active={active_channel_id}")
         return
 
     user       = evt.new_chat_member.user
@@ -878,17 +901,19 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         first_name = user.first_name or "there"
 
-        # FIX: Send left message — this was the primary bug.
-        # The message is now sent correctly with entity support.
+        # FIX: Send left message with custom premium emoji/entity support.
+        # Note: Telegram only allows DM if user has started the bot and not blocked it.
         text, ents = fmt_left_msg(first_name)
-        await safe_send(ctx, user.id, text, entities=ents)
+        sent = await safe_send(ctx, user.id, text, entities=ents)
 
         await notify_admins(
             ctx,
             f"{E_RED} <b>Member Left</b>\n\n"
             f"{E_EYES} {user.first_name} "
             f"({'@' + user.username if user.username else 'no username'})\n"
-            f"{E_INFO} ID: <code>{user.id}</code>",
+            f"{E_INFO} ID: <code>{user.id}</code>\n"
+            f"{E_CHAT} Leave DM: <b>{'Sent ✅' if sent else 'Failed ❌ — user must start bot / not block bot'}</b>\n"
+            f"{E_PIN} Active Channel: <code>{get_activity_channel_id()}</code>",
         )
 
 
@@ -965,6 +990,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["awaiting"] = "auto_accept_delay"
         await q.edit_message_text(
             f"{E_HOUR} Send the delay in <b>seconds</b> (0 = instant):\n"
+            f"/cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "set_activity_channel":
+        ctx.user_data["awaiting"] = "activity_channel_id"
+        await q.edit_message_text(
+            f"{E_MEGA} <b>Set Activity Channel</b>\n\n"
+            f"Send the channel ID for all bot activities.\n"
+            f"Current: <code>{get_activity_channel_id()}</code>\n\n"
+            f"Example: <code>-1002232875049</code>\n\n"
+            f"Make sure the bot is admin in that channel and has permission to receive member updates.\n"
             f"/cancel to abort.",
             parse_mode=ParseMode.HTML,
         )
@@ -1208,7 +1245,7 @@ async def _cb_ban_one(q, ctx, target_id: int):
     uid_str = str(target_id)
 
     try:
-        await ctx.bot.decline_chat_join_request(CHANNEL_ID, target_id)
+        await ctx.bot.decline_chat_join_request(get_activity_channel_id(), target_id)
     except Exception:
         pass
 
@@ -1365,7 +1402,8 @@ async def _show_settings(q, ctx):
     text = (
         f"{E_GEAR} <b>Settings</b>\n\n"
         f"{E_PLAY}  Auto Accept : {yn(aa)}\n"
-        f"{E_HOUR} Auto Delay  : {delay}s\n\n"
+        f"{E_HOUR} Auto Delay  : {delay}s\n"
+        f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
         f"  Accepted : {'✅ custom' if s.get('accepted_msg') else '❌ default'}\n"
@@ -1392,6 +1430,9 @@ async def _show_settings(q, ctx):
         [
             InlineKeyboardButton("📝 Left msg",  callback_data="setmsg_left"),
             InlineKeyboardButton("🗑 Reset All", callback_data="reset_msgs"),
+        ],
+        [
+            InlineKeyboardButton("📢 Set Activity Channel", callback_data="set_activity_channel"),
         ],
         [InlineKeyboardButton("🔙 Back", callback_data="adm_home")],
     ])
@@ -1518,7 +1559,7 @@ async def _pick_old_requests(q, ctx):
         pass
 
     try:
-        entity = await client.get_entity(CHANNEL_ID)
+        entity = await client.get_entity(get_activity_channel_id())
         result = await client(GetChatInviteImportersRequest(
             peer=entity,
             limit=100,
@@ -1598,7 +1639,7 @@ async def _fwd_test(q, ctx):
         try:
             await ctx.bot.copy_message(
                 chat_id=q.from_user.id,
-                from_chat_id=CHANNEL_ID,
+                from_chat_id=get_activity_channel_id(),
                 message_id=msg_id,
             )
             sent += 1
@@ -1882,6 +1923,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             ctx.user_data.pop("awaiting", None)
 
+    elif awaiting == "activity_channel_id":
+        channel_text = text.replace(" ", "")
+        if not channel_text.startswith("-100") or not channel_text[1:].isdigit():
+            await update.message.reply_text(
+                f"{E_CROSS} Send a valid private channel ID like <code>-1002232875049</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        set_activity_channel_id(int(channel_text))
+        ctx.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            f"{E_CHECK} <b>Activity channel updated!</b>\n"
+            f"{E_MEGA} New channel: <code>{get_activity_channel_id()}</code>\n\n"
+            f"{E_WARN} Make sure bot is admin in this channel, then restart/deploy the bot.",
+            reply_markup=admin_home_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
     elif awaiting == "auto_accept_delay":
         if text.isdigit():
             bot_data["settings"]["auto_accept_delay"] = int(text)
@@ -2029,7 +2088,7 @@ async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     first_name = info.get("first_name", "there") or "there"
 
     try:
-        await ctx.bot.approve_chat_join_request(CHANNEL_ID, uid)
+        await ctx.bot.approve_chat_join_request(get_activity_channel_id(), uid)
     except BadRequest as e:
         logger.info(f"cmd /accept uid={uid}: {e}")
 
@@ -2062,7 +2121,7 @@ async def cmd_decline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     first_name = info.get("first_name", "there") or "there"
 
     try:
-        await ctx.bot.decline_chat_join_request(CHANNEL_ID, uid)
+        await ctx.bot.decline_chat_join_request(get_activity_channel_id(), uid)
     except BadRequest as e:
         logger.info(f"cmd /decline uid={uid}: {e}")
 
@@ -2089,7 +2148,7 @@ async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid_str = ctx.args[0]
     try:
-        await ctx.bot.decline_chat_join_request(CHANNEL_ID, int(uid_str))
+        await ctx.bot.decline_chat_join_request(get_activity_channel_id(), int(uid_str))
     except Exception:
         pass
     bot_data["pending_requests"].pop(uid_str, None)
@@ -2139,7 +2198,7 @@ async def cmd_acceptall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid        = int(uid_str)
         first_name = info.get("first_name", "there") or "there"
         try:
-            await ctx.bot.approve_chat_join_request(CHANNEL_ID, uid)
+            await ctx.bot.approve_chat_join_request(get_activity_channel_id(), uid)
         except Exception:
             pass
         if uid_str not in bot_data["accepted_users"]:
@@ -2174,7 +2233,7 @@ async def cmd_declineall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid        = int(uid_str)
         first_name = info.get("first_name", "there") or "there"
         try:
-            await ctx.bot.decline_chat_join_request(CHANNEL_ID, uid)
+            await ctx.bot.decline_chat_join_request(get_activity_channel_id(), uid)
         except Exception:
             pass
         if uid_str not in bot_data["declined_users"]:
@@ -2255,7 +2314,7 @@ async def cmd_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{E_HOUR} Fetching old requests…", parse_mode=ParseMode.HTML
     )
     try:
-        entity = await client.get_entity(CHANNEL_ID)
+        entity = await client.get_entity(get_activity_channel_id())
         result = await client(GetChatInviteImportersRequest(
             peer=entity, limit=100, requested=True,
             offset_date=None, offset_user=InputUserEmpty(), q="",
@@ -2490,7 +2549,7 @@ def main():
 
     print("=" * 54)
     print("  🤖  Advanced Request-Accept Bot  —  RUNNING")
-    print(f"  📢  Channel  : {CHANNEL_ID}")
+    print(f"  📢  Channel  : {get_activity_channel_id()}")
     print(f"  👑  Admins   : {ADMIN_IDS}")
     print(f"  📨  Fwd IDs  : {FORWARD_MSG_IDS}")
     print("=" * 54)
