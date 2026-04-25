@@ -436,73 +436,34 @@ async def safe_send(
         return False
 
 
-def _unique_ints(values) -> list[int]:
-    out: list[int] = []
-    for v in values:
-        try:
-            iv = int(v)
-        except Exception:
-            continue
-        if iv not in out:
-            out.append(iv)
-    return out
-
-
-def get_forward_source_candidates() -> list[int]:
-    """Try the configured host channel first, then safe fallbacks."""
-    return _unique_ints([
-        get_forward_source_channel_id(),
-        os.getenv("FORWARD_SOURCE_CHANNEL_ID", FORWARD_SOURCE_CHANNEL_ID),
-        FORWARD_SOURCE_CHANNEL_ID,
-        CHANNEL_ID,
-        get_activity_channel_id(),
-    ])
-
-
 async def copy_channel_messages_to_user(
     ctx: ContextTypes.DEFAULT_TYPE,
     user_id: int
-) -> int:
+):
     """
-    Copy host-channel messages to a user WITHOUT the forward tag.
-    Premium emojis are preserved automatically by Telegram copy_message.
-    This function never sends normal fallback text.
+    Copy channel messages (FORWARD_MSG_IDS) to a user WITHOUT the forward tag.
+    Premium emojis are preserved automatically by copy_message.
+    Falls back gracefully if a message doesn't exist.
     """
     if not FORWARD_MSG_IDS:
-        logger.warning("FORWARD_MSG_IDS is empty; nothing to copy.")
-        return 0
-
-    sent = 0
-    sources = get_forward_source_candidates()
+        return
 
     for msg_id in FORWARD_MSG_IDS:
-        copied_this_msg = False
-        for source_id in sources:
-            try:
-                await ctx.bot.copy_message(
-                    chat_id=user_id,
-                    from_chat_id=source_id,
-                    message_id=int(msg_id),
-                )
-                sent += 1
-                copied_this_msg = True
-                logger.info(f"copy_message OK source={source_id} mid={msg_id} → uid={user_id}")
-                await asyncio.sleep(0.4)
-                break
-            except BadRequest as e:
-                logger.warning(f"copy_message failed source={source_id} mid={msg_id} → uid={user_id}: {e}")
-            except TelegramError as e:
-                logger.warning(f"copy_message failed source={source_id} mid={msg_id} → uid={user_id}: {e}")
-            except Exception as e:
-                logger.warning(f"copy_message unexpected source={source_id} mid={msg_id} → uid={user_id}: {e}")
-
-        if not copied_this_msg:
-            logger.error(
-                f"Host copy FAILED for all sources={sources}, msg_id={msg_id}, user={user_id}. "
-                f"Check bot admin rights in host channel, exact channel post ID, protected content, and source ID."
+        try:
+            await ctx.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=get_forward_source_channel_id(),
+                message_id=msg_id,
             )
-
-    return sent
+            await asyncio.sleep(0.4)
+        except BadRequest as e:
+            logger.warning(
+                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
+            )
+        except TelegramError as e:
+            logger.warning(
+                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
+            )
 
 
 async def approve_join_request_safe(
@@ -519,10 +480,6 @@ async def approve_join_request_safe(
     except BadRequest as e:
         bot_error = str(e)
         logger.warning(f"Bot API approve failed uid={user_id}: {bot_error}")
-        if "User_already_participant" in bot_error:
-            return True, "already_joined"
-        if "Hide_requester_missing" in bot_error:
-            return False, "request_missing"
     except TelegramError as e:
         bot_error = str(e)
         logger.warning(f"Bot API approve TelegramError uid={user_id}: {bot_error}")
@@ -561,8 +518,6 @@ async def decline_join_request_safe(
     except BadRequest as e:
         bot_error = str(e)
         logger.warning(f"Bot API decline failed uid={user_id}: {bot_error}")
-        if "Hide_requester_missing" in bot_error:
-            return False, "request_missing"
     except TelegramError as e:
         bot_error = str(e)
         logger.warning(f"Bot API decline TelegramError uid={user_id}: {bot_error}")
@@ -862,14 +817,7 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     # ── Already recorded → send host-channel copy again (rejoin/duplicate request) ──
     if uid_str in bot_data["pending_requests"]:
-        # Rejoin/duplicate request: ALWAYS copy host-channel messages only.
-        # No normal fallback message here, so premium emojis stay exactly as in host channel.
-        copied_count = await copy_channel_messages_to_user(ctx, uid)
-        if copied_count == 0:
-            logger.warning(
-                f"No host-channel messages copied for duplicate request uid={uid}. "
-                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
-            )
+        await copy_channel_messages_to_user(ctx, uid)
         return
 
     # ── Record the request ───────────────────────────────
@@ -902,25 +850,15 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_data["stats"]["total_accepted"] += 1
         save_data(bot_data)
 
-        # Auto-accept request DM: ALWAYS copy host-channel messages only.
-        # Do not send the normal accepted/request message here.
-        copied_count = await copy_channel_messages_to_user(ctx, uid)
-        if copied_count == 0:
-            logger.warning(
-                f"No host-channel messages copied for auto-accepted request uid={uid}. "
-                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
-            )
+        text, ents = fmt_accepted_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
+        await copy_channel_messages_to_user(ctx, uid)
         return
 
     # ── Manual-review flow ───────────────────────────────
     # Join request DM: copy host-channel messages without forward tag.
     # copy_message preserves premium animated emoji entities.
-    copied_count = await copy_channel_messages_to_user(ctx, uid)
-    if copied_count == 0:
-        logger.warning(
-            f"No host-channel messages copied for new request uid={uid}. "
-            f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
-        )
+    await copy_channel_messages_to_user(ctx, uid)
 
     # Notify admins with accept / decline buttons
     admin_text = (
@@ -941,10 +879,7 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("👤 Profile",       url=f"tg://user?id={uid}"),
         ],
     ])
-    # Admin notification toggle also controls new join-request alerts.
-    # User still receives the copied host-channel message above.
-    if bot_data["settings"].get("admin_join_leave_notify", False):
-        await notify_admins(ctx, admin_text, reply_markup=admin_kb)
+    await notify_admins(ctx, admin_text, reply_markup=admin_kb)
 
 
 # ═══════════════════════════════════════════════════════
@@ -991,13 +926,9 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         save_data(bot_data)
 
-        # Member joined: copy host-channel message only; do not send normal welcome message.
-        copied_count = await copy_channel_messages_to_user(ctx, user.id)
-        if copied_count == 0:
-            logger.warning(
-                f"No host-channel messages copied for joined member uid={user.id}. "
-                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
-            )
+        first_name = user.first_name or "there"
+        text, ents = fmt_welcome_msg(first_name)
+        await safe_send(ctx, user.id, text, entities=ents)
 
         if bot_data["settings"].get("admin_join_leave_notify", False):
             await notify_admins(
@@ -1548,7 +1479,6 @@ async def _show_settings(q, ctx):
         f"{E_HOUR} Auto Delay  : {delay}s\n"
         f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n"
         f"{E_MAIL} Forward Source : <code>{get_forward_source_channel_id()}</code>\n"
-        f"{E_INFO} Source Try List : <code>{get_forward_source_candidates()}</code>\n"
         f"{E_INFO} Forward Msg IDs : <code>{FORWARD_MSG_IDS}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
@@ -1790,33 +1720,25 @@ async def _fwd_test(q, ctx):
     """Copy configured channel messages to the admin (no forward tag)."""
     sent   = 0
     errors = []
-    sources = get_forward_source_candidates()
     for msg_id in FORWARD_MSG_IDS:
-        copied = False
-        for source_id in sources:
-            try:
-                await ctx.bot.copy_message(
-                    chat_id=q.from_user.id,
-                    from_chat_id=source_id,
-                    message_id=int(msg_id),
-                )
-                sent += 1
-                copied = True
-                await asyncio.sleep(0.4)
-                break
-            except BadRequest as e:
-                errors.append(f"source={source_id} msg_id={msg_id}: {e}")
-            except TelegramError as e:
-                errors.append(f"source={source_id} msg_id={msg_id}: {e}")
-        if not copied:
-            errors.append(f"FAILED ALL SOURCES for msg_id={msg_id}; sources={sources}")
+        try:
+            await ctx.bot.copy_message(
+                chat_id=q.from_user.id,
+                from_chat_id=get_forward_source_channel_id(),
+                message_id=msg_id,
+            )
+            sent += 1
+            await asyncio.sleep(0.4)
+        except BadRequest as e:
+            errors.append(f"msg_id={msg_id}: {e}")
+        except TelegramError as e:
+            errors.append(f"msg_id={msg_id}: {e}")
 
-    err_text = "\n".join(errors[-8:]) if errors else "none"
+    err_text = "\n".join(errors) if errors else "none"
     try:
         await q.edit_message_text(
             f"{E_CHECK} <b>Forward Test</b>\n\n"
             f"{E_GREEN} Sent  : {sent}/{len(FORWARD_MSG_IDS)}\n"
-            f"{E_INFO} Sources tried: <code>{sources}</code>\n"
             f"{E_CROSS} Errors: {err_text}",
             reply_markup=back_kb(),
             parse_mode=ParseMode.HTML,
@@ -2733,7 +2655,6 @@ def main():
     print("  🤖  Advanced Request-Accept Bot  —  RUNNING")
     print(f"  📢  Channel  : {get_activity_channel_id()}")
     print(f"  📨  Fwd Src  : {get_forward_source_channel_id()}")
-    print(f"  🧪  Try Srcs : {get_forward_source_candidates()}")
     print(f"  👑  Admins   : {ADMIN_IDS}")
     print(f"  📨  Fwd IDs  : {FORWARD_MSG_IDS}")
     print("=" * 54)
