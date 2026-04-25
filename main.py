@@ -46,7 +46,7 @@ CHANNEL_ID       = -1002232875049
 DATA_FILE        = "bot_data.json"
 
 # Message IDs inside the channel to copy (no forward tag) to users
-FORWARD_MSG_IDS  = [10, 11]
+FORWARD_MSG_IDS  = [12, 13]
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
