@@ -436,36 +436,72 @@ async def safe_send(
         return False
 
 
+def _unique_ints(values) -> list[int]:
+    out: list[int] = []
+    for v in values:
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv not in out:
+            out.append(iv)
+    return out
+
+
+def get_forward_source_candidates() -> list[int]:
+    """Try the configured host channel first, then safe fallbacks."""
+    return _unique_ints([
+        get_forward_source_channel_id(),
+        os.getenv("FORWARD_SOURCE_CHANNEL_ID", FORWARD_SOURCE_CHANNEL_ID),
+        FORWARD_SOURCE_CHANNEL_ID,
+        CHANNEL_ID,
+        get_activity_channel_id(),
+    ])
+
+
 async def copy_channel_messages_to_user(
     ctx: ContextTypes.DEFAULT_TYPE,
     user_id: int
 ) -> int:
     """
-    Copy channel messages (FORWARD_MSG_IDS) to a user WITHOUT the forward tag.
-    Premium emojis are preserved automatically by copy_message.
-    Falls back gracefully if a message doesn't exist.
+    Copy host-channel messages to a user WITHOUT the forward tag.
+    Premium emojis are preserved automatically by Telegram copy_message.
+    This function never sends normal fallback text.
     """
     if not FORWARD_MSG_IDS:
+        logger.warning("FORWARD_MSG_IDS is empty; nothing to copy.")
         return 0
 
     sent = 0
+    sources = get_forward_source_candidates()
+
     for msg_id in FORWARD_MSG_IDS:
-        try:
-            await ctx.bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=get_forward_source_channel_id(),
-                message_id=msg_id,
+        copied_this_msg = False
+        for source_id in sources:
+            try:
+                await ctx.bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=source_id,
+                    message_id=int(msg_id),
+                )
+                sent += 1
+                copied_this_msg = True
+                logger.info(f"copy_message OK source={source_id} mid={msg_id} → uid={user_id}")
+                await asyncio.sleep(0.4)
+                break
+            except BadRequest as e:
+                logger.warning(f"copy_message failed source={source_id} mid={msg_id} → uid={user_id}: {e}")
+            except TelegramError as e:
+                logger.warning(f"copy_message failed source={source_id} mid={msg_id} → uid={user_id}: {e}")
+            except Exception as e:
+                logger.warning(f"copy_message unexpected source={source_id} mid={msg_id} → uid={user_id}: {e}")
+
+        if not copied_this_msg:
+            logger.error(
+                f"Host copy FAILED for all sources={sources}, msg_id={msg_id}, user={user_id}. "
+                f"Check bot admin rights in host channel, exact channel post ID, protected content, and source ID."
             )
-            sent += 1
-            await asyncio.sleep(0.4)
-        except BadRequest as e:
-            logger.warning(
-                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
-            )
-        except TelegramError as e:
-            logger.warning(
-                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
-            )
+
     return sent
 
 
@@ -1512,6 +1548,7 @@ async def _show_settings(q, ctx):
         f"{E_HOUR} Auto Delay  : {delay}s\n"
         f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n"
         f"{E_MAIL} Forward Source : <code>{get_forward_source_channel_id()}</code>\n"
+        f"{E_INFO} Source Try List : <code>{get_forward_source_candidates()}</code>\n"
         f"{E_INFO} Forward Msg IDs : <code>{FORWARD_MSG_IDS}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
@@ -1753,25 +1790,33 @@ async def _fwd_test(q, ctx):
     """Copy configured channel messages to the admin (no forward tag)."""
     sent   = 0
     errors = []
+    sources = get_forward_source_candidates()
     for msg_id in FORWARD_MSG_IDS:
-        try:
-            await ctx.bot.copy_message(
-                chat_id=q.from_user.id,
-                from_chat_id=get_forward_source_channel_id(),
-                message_id=msg_id,
-            )
-            sent += 1
-            await asyncio.sleep(0.4)
-        except BadRequest as e:
-            errors.append(f"msg_id={msg_id}: {e}")
-        except TelegramError as e:
-            errors.append(f"msg_id={msg_id}: {e}")
+        copied = False
+        for source_id in sources:
+            try:
+                await ctx.bot.copy_message(
+                    chat_id=q.from_user.id,
+                    from_chat_id=source_id,
+                    message_id=int(msg_id),
+                )
+                sent += 1
+                copied = True
+                await asyncio.sleep(0.4)
+                break
+            except BadRequest as e:
+                errors.append(f"source={source_id} msg_id={msg_id}: {e}")
+            except TelegramError as e:
+                errors.append(f"source={source_id} msg_id={msg_id}: {e}")
+        if not copied:
+            errors.append(f"FAILED ALL SOURCES for msg_id={msg_id}; sources={sources}")
 
-    err_text = "\n".join(errors) if errors else "none"
+    err_text = "\n".join(errors[-8:]) if errors else "none"
     try:
         await q.edit_message_text(
             f"{E_CHECK} <b>Forward Test</b>\n\n"
             f"{E_GREEN} Sent  : {sent}/{len(FORWARD_MSG_IDS)}\n"
+            f"{E_INFO} Sources tried: <code>{sources}</code>\n"
             f"{E_CROSS} Errors: {err_text}",
             reply_markup=back_kb(),
             parse_mode=ParseMode.HTML,
@@ -2688,6 +2733,7 @@ def main():
     print("  🤖  Advanced Request-Accept Bot  —  RUNNING")
     print(f"  📢  Channel  : {get_activity_channel_id()}")
     print(f"  📨  Fwd Src  : {get_forward_source_channel_id()}")
+    print(f"  🧪  Try Srcs : {get_forward_source_candidates()}")
     print(f"  👑  Admins   : {ADMIN_IDS}")
     print(f"  📨  Fwd IDs  : {FORWARD_MSG_IDS}")
     print("=" * 54)
