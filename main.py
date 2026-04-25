@@ -439,15 +439,16 @@ async def safe_send(
 async def copy_channel_messages_to_user(
     ctx: ContextTypes.DEFAULT_TYPE,
     user_id: int
-):
+) -> int:
     """
     Copy channel messages (FORWARD_MSG_IDS) to a user WITHOUT the forward tag.
     Premium emojis are preserved automatically by copy_message.
     Falls back gracefully if a message doesn't exist.
     """
     if not FORWARD_MSG_IDS:
-        return
+        return 0
 
+    sent = 0
     for msg_id in FORWARD_MSG_IDS:
         try:
             await ctx.bot.copy_message(
@@ -455,6 +456,7 @@ async def copy_channel_messages_to_user(
                 from_chat_id=get_forward_source_channel_id(),
                 message_id=msg_id,
             )
+            sent += 1
             await asyncio.sleep(0.4)
         except BadRequest as e:
             logger.warning(
@@ -464,6 +466,7 @@ async def copy_channel_messages_to_user(
             logger.warning(
                 f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
             )
+    return sent
 
 
 async def approve_join_request_safe(
@@ -480,6 +483,10 @@ async def approve_join_request_safe(
     except BadRequest as e:
         bot_error = str(e)
         logger.warning(f"Bot API approve failed uid={user_id}: {bot_error}")
+        if "User_already_participant" in bot_error:
+            return True, "already_joined"
+        if "Hide_requester_missing" in bot_error:
+            return False, "request_missing"
     except TelegramError as e:
         bot_error = str(e)
         logger.warning(f"Bot API approve TelegramError uid={user_id}: {bot_error}")
@@ -518,6 +525,8 @@ async def decline_join_request_safe(
     except BadRequest as e:
         bot_error = str(e)
         logger.warning(f"Bot API decline failed uid={user_id}: {bot_error}")
+        if "Hide_requester_missing" in bot_error:
+            return False, "request_missing"
     except TelegramError as e:
         bot_error = str(e)
         logger.warning(f"Bot API decline TelegramError uid={user_id}: {bot_error}")
@@ -817,7 +826,11 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     # ── Already recorded → send host-channel copy again (rejoin/duplicate request) ──
     if uid_str in bot_data["pending_requests"]:
-        await copy_channel_messages_to_user(ctx, uid)
+        copied_count = await copy_channel_messages_to_user(ctx, uid)
+        if copied_count == 0:
+            first_name = user.first_name or "there"
+            text, ents = fmt_request_msg(first_name)
+            await safe_send(ctx, uid, text, entities=ents)
         return
 
     # ── Record the request ───────────────────────────────
@@ -858,7 +871,10 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Manual-review flow ───────────────────────────────
     # Join request DM: copy host-channel messages without forward tag.
     # copy_message preserves premium animated emoji entities.
-    await copy_channel_messages_to_user(ctx, uid)
+    copied_count = await copy_channel_messages_to_user(ctx, uid)
+    if copied_count == 0:
+        text, ents = fmt_request_msg(first_name)
+        await safe_send(ctx, uid, text, entities=ents)
 
     # Notify admins with accept / decline buttons
     admin_text = (
