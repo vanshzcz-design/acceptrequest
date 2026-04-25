@@ -46,7 +46,7 @@ CHANNEL_ID       = -1002232875049
 DATA_FILE        = "bot_data.json"
 
 # Message IDs inside the channel to copy (no forward tag) to users
-FORWARD_MSG_IDS  = [12, 13]
+FORWARD_MSG_IDS  = [10, 11]
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -141,7 +141,6 @@ _DEFAULTS: dict = {
         "left_entities":      None,
         "auto_accept":        False,
         "auto_accept_delay":  0,
-        "admin_notifications": False,
         "activity_channel_id": CHANNEL_ID,
     },
     "telethon_session":  None,
@@ -196,11 +195,6 @@ def get_activity_channel_id() -> int:
 def set_activity_channel_id(channel_id: int):
     bot_data.setdefault("settings", {})["activity_channel_id"] = int(channel_id)
     save_data(bot_data)
-
-
-def admin_notifications_enabled() -> bool:
-    """Admin join/leave notifications are OFF by default to prevent spam."""
-    return bool(bot_data.get("settings", {}).get("admin_notifications", False))
 
 # ═══════════════════════════════════════════════════════
 #  ENTITY SERIALIZATION (for premium emoji support)
@@ -376,12 +370,11 @@ async def safe_send(
     text: str,
     entities: list | None = None,
     **kwargs
-) -> bool:
+):
     """
     Send a message; silently ignore if user blocked the bot.
     If entities are provided (for premium emoji support), send without parse_mode.
     Otherwise send with HTML parse_mode.
-    Returns True when Telegram accepted the message, otherwise False.
     """
     try:
         if entities:
@@ -398,26 +391,22 @@ async def safe_send(
                 parse_mode=ParseMode.HTML,
                 **kwargs
             )
-        return True
     except TelegramError as e:
         logger.debug(f"safe_send uid={uid}: {e}")
-        return False
 
 
 async def copy_channel_messages_to_user(
     ctx: ContextTypes.DEFAULT_TYPE,
     user_id: int
-) -> int:
+):
     """
     Copy channel messages (FORWARD_MSG_IDS) to a user WITHOUT the forward tag.
     Premium emojis are preserved automatically by copy_message.
     Falls back gracefully if a message doesn't exist.
-    Returns the number of copied messages.
     """
     if not FORWARD_MSG_IDS:
-        return 0
+        return
 
-    sent = 0
     for msg_id in FORWARD_MSG_IDS:
         try:
             await ctx.bot.copy_message(
@@ -425,7 +414,6 @@ async def copy_channel_messages_to_user(
                 from_chat_id=get_activity_channel_id(),
                 message_id=msg_id,
             )
-            sent += 1
             await asyncio.sleep(0.4)
         except BadRequest as e:
             logger.warning(
@@ -435,7 +423,6 @@ async def copy_channel_messages_to_user(
             logger.warning(
                 f"copy_message mid={msg_id} → uid={user_id}: {e}"
             )
-    return sent
 
 
 async def approve_join_request_safe(
@@ -788,11 +775,8 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Already pending / re-request → send host-channel copied messages again ──
-    # This fixes rejoin/re-request users: every join request gets the same
-    # no-forward-tag host messages, with premium emojis preserved by copy_message.
+    # ── Already recorded → skip duplicate ───────────────
     if uid_str in bot_data["pending_requests"]:
-        await copy_channel_messages_to_user(ctx, uid)
         return
 
     # ── Record the request ───────────────────────────────
@@ -831,11 +815,11 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Manual-review flow ───────────────────────────────
-    # Do NOT send the normal request/welcome text here. Every join request
-    # must receive the copied host-channel messages only, without forward tag.
+    text, ents = fmt_request_msg(first_name)
+    await safe_send(ctx, uid, text, entities=ents)
     await copy_channel_messages_to_user(ctx, uid)
 
-    # Notify admins with accept / decline buttons only when enabled
+    # Notify admins with accept / decline buttons
     admin_text = (
         f"{E_NEW} <b>New Join Request</b>\n\n"
         f"{E_EYES} <b>Name:</b> {user.first_name or ''} {user.last_name or ''}\n"
@@ -854,8 +838,7 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("👤 Profile",       url=f"tg://user?id={uid}"),
         ],
     ])
-    if admin_notifications_enabled():
-        await notify_admins(ctx, admin_text, reply_markup=admin_kb)
+    await notify_admins(ctx, admin_text, reply_markup=admin_kb)
 
 
 # ═══════════════════════════════════════════════════════
@@ -902,9 +885,9 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         save_data(bot_data)
 
-        # Normal welcome DM is intentionally not sent here.
-        # Join-request users already receive copied host-channel messages
-        # with no forward tag when they request/re-request.
+        first_name = user.first_name or "there"
+        text, ents = fmt_welcome_msg(first_name)
+        await safe_send(ctx, user.id, text, entities=ents)
 
     # ── LEFT / KICKED ────────────────────────────────────
     elif old_status in ACTIVE_STATUSES and new_status in LEFT_STATUSES:
@@ -923,16 +906,15 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, ents = fmt_left_msg(first_name)
         sent = await safe_send(ctx, user.id, text, entities=ents)
 
-        if admin_notifications_enabled():
-            await notify_admins(
-                ctx,
-                f"{E_RED} <b>Member Left</b>\n\n"
-                f"{E_EYES} {user.first_name} "
-                f"({'@' + user.username if user.username else 'no username'})\n"
-                f"{E_INFO} ID: <code>{user.id}</code>\n"
-                f"{E_CHAT} Leave DM: <b>{'Sent ✅' if sent else 'Failed ❌ — user must start bot / not block bot'}</b>\n"
-                f"{E_PIN} Active Channel: <code>{get_activity_channel_id()}</code>",
-            )
+        await notify_admins(
+            ctx,
+            f"{E_RED} <b>Member Left</b>\n\n"
+            f"{E_EYES} {user.first_name} "
+            f"({'@' + user.username if user.username else 'no username'})\n"
+            f"{E_INFO} ID: <code>{user.id}</code>\n"
+            f"{E_CHAT} Leave DM: <b>{'Sent ✅' if sent else 'Failed ❌ — user must start bot / not block bot'}</b>\n"
+            f"{E_PIN} Active Channel: <code>{get_activity_channel_id()}</code>",
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -1000,13 +982,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "toggle_auto_accept":
         bot_data["settings"]["auto_accept"] = not bot_data["settings"].get(
             "auto_accept", False
-        )
-        save_data(bot_data)
-        await _show_settings(q, ctx)
-
-    elif data == "toggle_admin_notifications":
-        bot_data["settings"]["admin_notifications"] = not bot_data["settings"].get(
-            "admin_notifications", False
         )
         save_data(bot_data)
         await _show_settings(q, ctx)
@@ -1421,7 +1396,6 @@ async def _show_settings(q, ctx):
     s     = bot_data["settings"]
     aa    = s.get("auto_accept", False)
     delay = s.get("auto_accept_delay", 0)
-    admin_notifs = s.get("admin_notifications", False)
 
     def yn(v): return "✅ On" if v else "❌ Off"
 
@@ -1429,7 +1403,6 @@ async def _show_settings(q, ctx):
         f"{E_GEAR} <b>Settings</b>\n\n"
         f"{E_PLAY}  Auto Accept : {yn(aa)}\n"
         f"{E_HOUR} Auto Delay  : {delay}s\n"
-        f"{E_BELL} Admin Join/Leave Notifications : {yn(admin_notifs)}\n"
         f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
@@ -1445,12 +1418,6 @@ async def _show_settings(q, ctx):
                 callback_data="toggle_auto_accept",
             ),
             InlineKeyboardButton("⏱ Set Delay", callback_data="set_delay"),
-        ],
-        [
-            InlineKeyboardButton(
-                f"{'🔴 Disable' if admin_notifs else '🟢 Enable'} Admin Notifications",
-                callback_data="toggle_admin_notifications",
-            ),
         ],
         [
             InlineKeyboardButton("📝 Request msg",  callback_data="setmsg_request"),
