@@ -45,8 +45,22 @@ ADMIN_ID         = ADMIN_IDS[0]
 CHANNEL_ID       = -1002232875049
 DATA_FILE        = "bot_data.json"
 
-# Message IDs inside the channel to copy (no forward tag) to users
-FORWARD_MSG_IDS  = [10, 11]
+# Source channel where message IDs below exist.
+# If your host/source channel is different from the request channel, set
+# FORWARD_SOURCE_CHANNEL_ID in Railway Variables, example: -1002701185142
+FORWARD_SOURCE_CHANNEL_ID = int(os.getenv("FORWARD_SOURCE_CHANNEL_ID", "-1002701185142"))
+
+# Message IDs inside the source/host channel to copy (no forward tag) to users.
+# You can override from Railway Variables: FORWARD_MSG_IDS=10,11
+def _parse_forward_msg_ids() -> list[int]:
+    raw = os.getenv("FORWARD_MSG_IDS", "10,11")
+    ids: list[int] = []
+    for part in raw.replace(" ", "").split(","):
+        if part and part.lstrip("-").isdigit():
+            ids.append(int(part))
+    return ids or [10, 11]
+
+FORWARD_MSG_IDS  = _parse_forward_msg_ids()
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -142,6 +156,7 @@ _DEFAULTS: dict = {
         "auto_accept":        False,
         "auto_accept_delay":  0,
         "activity_channel_id": CHANNEL_ID,
+        "forward_source_channel_id": FORWARD_SOURCE_CHANNEL_ID,
         "admin_join_leave_notify": False,
     },
     "telethon_session":  None,
@@ -181,6 +196,14 @@ def save_data(data: dict):
 
 
 bot_data: dict = load_data()
+# Migration: if an old DB stored the request channel as forward source, reset it to host channel.
+try:
+    _settings = bot_data.setdefault("settings", {})
+    if int(_settings.get("forward_source_channel_id") or CHANNEL_ID) == int(CHANNEL_ID):
+        _settings["forward_source_channel_id"] = int(FORWARD_SOURCE_CHANNEL_ID)
+        save_data(bot_data)
+except Exception as _e:
+    logger.warning(f"forward source migration skipped: {_e}")
 
 
 def get_activity_channel_id() -> int:
@@ -195,6 +218,21 @@ def get_activity_channel_id() -> int:
 
 def set_activity_channel_id(channel_id: int):
     bot_data.setdefault("settings", {})["activity_channel_id"] = int(channel_id)
+    save_data(bot_data)
+
+
+def get_forward_source_channel_id() -> int:
+    """Return the host/source channel ID used for copy_message.
+    This can be different from the activity/request channel.
+    """
+    try:
+        return int(bot_data.get("settings", {}).get("forward_source_channel_id") or FORWARD_SOURCE_CHANNEL_ID)
+    except Exception:
+        return int(FORWARD_SOURCE_CHANNEL_ID)
+
+
+def set_forward_source_channel_id(channel_id: int):
+    bot_data.setdefault("settings", {})["forward_source_channel_id"] = int(channel_id)
     save_data(bot_data)
 
 # ═══════════════════════════════════════════════════════
@@ -392,8 +430,10 @@ async def safe_send(
                 parse_mode=ParseMode.HTML,
                 **kwargs
             )
+        return True
     except TelegramError as e:
         logger.debug(f"safe_send uid={uid}: {e}")
+        return False
 
 
 async def copy_channel_messages_to_user(
@@ -412,17 +452,17 @@ async def copy_channel_messages_to_user(
         try:
             await ctx.bot.copy_message(
                 chat_id=user_id,
-                from_chat_id=get_activity_channel_id(),
+                from_chat_id=get_forward_source_channel_id(),
                 message_id=msg_id,
             )
             await asyncio.sleep(0.4)
         except BadRequest as e:
             logger.warning(
-                f"copy_message mid={msg_id} → uid={user_id}: {e}"
+                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
             )
         except TelegramError as e:
             logger.warning(
-                f"copy_message mid={msg_id} → uid={user_id}: {e}"
+                f"copy_message source={get_forward_source_channel_id()} mid={msg_id} → uid={user_id}: {e}"
             )
 
 
@@ -1025,6 +1065,19 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
         )
 
+
+    elif data == "set_forward_source_channel":
+        ctx.user_data["awaiting"] = "forward_source_channel_id"
+        await q.edit_message_text(
+            f"{E_MEGA} <b>Set Forward Source Channel</b>\n\n"
+            f"Send the host/source channel ID where message IDs {FORWARD_MSG_IDS} exist.\n"
+            f"Current: <code>{get_forward_source_channel_id()}</code>\n\n"
+            f"Example: <code>-1002701185142</code>\n\n"
+            f"Make sure the bot is admin in that source channel and can read/copy messages.\n"
+            f"/cancel to abort.",
+            parse_mode=ParseMode.HTML,
+        )
+
     elif data.startswith("setmsg_"):
         msg_type = data[7:]
         ctx.user_data["awaiting"] = f"setmsg_{msg_type}"
@@ -1424,7 +1477,9 @@ async def _show_settings(q, ctx):
         f"{E_PLAY}  Auto Accept : {yn(aa)}\n"
         f"{E_BELL} Admin Join/Leave Notify : {yn(admin_notify)}\n"
         f"{E_HOUR} Auto Delay  : {delay}s\n"
-        f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n\n"
+        f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n"
+        f"{E_MAIL} Forward Source : <code>{get_forward_source_channel_id()}</code>\n"
+        f"{E_INFO} Forward Msg IDs : <code>{FORWARD_MSG_IDS}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
         f"  Accepted : {'✅ custom' if s.get('accepted_msg') else '❌ default'}\n"
@@ -1460,6 +1515,9 @@ async def _show_settings(q, ctx):
         ],
         [
             InlineKeyboardButton("📢 Set Activity Channel", callback_data="set_activity_channel"),
+        ],
+        [
+            InlineKeyboardButton("📨 Set Forward Source", callback_data="set_forward_source_channel"),
         ],
         [InlineKeyboardButton("🔙 Back", callback_data="adm_home")],
     ])
@@ -1666,7 +1724,7 @@ async def _fwd_test(q, ctx):
         try:
             await ctx.bot.copy_message(
                 chat_id=q.from_user.id,
-                from_chat_id=get_activity_channel_id(),
+                from_chat_id=get_forward_source_channel_id(),
                 message_id=msg_id,
             )
             sent += 1
@@ -1964,6 +2022,25 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"{E_CHECK} <b>Activity channel updated!</b>\n"
             f"{E_MEGA} New channel: <code>{get_activity_channel_id()}</code>\n\n"
             f"{E_WARN} Make sure bot is admin in this channel, then restart/deploy the bot.",
+            reply_markup=admin_home_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+    elif awaiting == "forward_source_channel_id":
+        channel_text = text.replace(" ", "")
+        if not channel_text.startswith("-100") or not channel_text[1:].isdigit():
+            await update.message.reply_text(
+                f"{E_CROSS} Send a valid private channel ID like <code>-1002701185142</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        set_forward_source_channel_id(int(channel_text))
+        ctx.user_data.pop("awaiting", None)
+        await update.message.reply_text(
+            f"{E_CHECK} <b>Forward source channel updated!</b>\n"
+            f"{E_MAIL} New source: <code>{get_forward_source_channel_id()}</code>\n\n"
+            f"{E_WARN} Now use 📨 Forward Test. If it still says message not found, the message IDs are wrong or bot cannot access that source channel.",
             reply_markup=admin_home_kb(),
             parse_mode=ParseMode.HTML,
         )
@@ -2577,6 +2654,7 @@ def main():
     print("=" * 54)
     print("  🤖  Advanced Request-Accept Bot  —  RUNNING")
     print(f"  📢  Channel  : {get_activity_channel_id()}")
+    print(f"  📨  Fwd Src  : {get_forward_source_channel_id()}")
     print(f"  👑  Admins   : {ADMIN_IDS}")
     print(f"  📨  Fwd IDs  : {FORWARD_MSG_IDS}")
     print("=" * 54)
