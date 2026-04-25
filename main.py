@@ -141,9 +141,6 @@ _DEFAULTS: dict = {
         "left_entities":      None,
         "auto_accept":        False,
         "auto_accept_delay":  0,
-        # Default OFF to prevent notification spam. Admin can toggle from Settings.
-        "join_notifications": False,
-        "leave_notifications": False,
         "activity_channel_id": CHANNEL_ID,
     },
     "telethon_session":  None,
@@ -394,10 +391,8 @@ async def safe_send(
                 parse_mode=ParseMode.HTML,
                 **kwargs
             )
-        return True
     except TelegramError as e:
         logger.debug(f"safe_send uid={uid}: {e}")
-        return False
 
 
 async def copy_channel_messages_to_user(
@@ -780,15 +775,8 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Already recorded → avoid normal duplicate spam.
-    # If the user had left before and requests again, resend the same request
-    # message + copied host-channel messages as requested.
+    # ── Already recorded → skip duplicate ───────────────
     if uid_str in bot_data["pending_requests"]:
-        if uid_str in bot_data.get("left_members", []):
-            first_name = user.first_name or "there"
-            text, ents = fmt_request_msg(first_name)
-            await safe_send(ctx, uid, text, entities=ents)
-            await copy_channel_messages_to_user(ctx, uid)
         return
 
     # ── Record the request ───────────────────────────────
@@ -800,9 +788,6 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "date":       datetime.now().isoformat(),
     }
     bot_data["stats"]["total_requests"] += 1
-    # Keep history, but make the new request active again.
-    # This allows previous leavers to receive the request message again.
-    bot_data["left_members"] = [u for u in bot_data.get("left_members", []) if u != uid_str]
     save_data(bot_data)
 
     first_name = user.first_name or "there"
@@ -900,10 +885,9 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         save_data(bot_data)
 
-        if bot_data.get("settings", {}).get("join_notifications", False):
-            first_name = user.first_name or "there"
-            text, ents = fmt_welcome_msg(first_name)
-            await safe_send(ctx, user.id, text, entities=ents)
+        first_name = user.first_name or "there"
+        text, ents = fmt_welcome_msg(first_name)
+        await safe_send(ctx, user.id, text, entities=ents)
 
     # ── LEFT / KICKED ────────────────────────────────────
     elif old_status in ACTIVE_STATUSES and new_status in LEFT_STATUSES:
@@ -915,23 +899,22 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_data["stats"]["total_left"] += 1
         save_data(bot_data)
 
-        if bot_data.get("settings", {}).get("leave_notifications", False):
-            first_name = user.first_name or "there"
+        first_name = user.first_name or "there"
 
-            # FIX: Send left message with custom premium emoji/entity support.
-            # Note: Telegram only allows DM if user has started the bot and not blocked it.
-            text, ents = fmt_left_msg(first_name)
-            sent = await safe_send(ctx, user.id, text, entities=ents)
+        # FIX: Send left message with custom premium emoji/entity support.
+        # Note: Telegram only allows DM if user has started the bot and not blocked it.
+        text, ents = fmt_left_msg(first_name)
+        sent = await safe_send(ctx, user.id, text, entities=ents)
 
-            await notify_admins(
-                ctx,
-                f"{E_RED} <b>Member Left</b>\n\n"
-                f"{E_EYES} {user.first_name} "
-                f"({'@' + user.username if user.username else 'no username'})\n"
-                f"{E_INFO} ID: <code>{user.id}</code>\n"
-                f"{E_CHAT} Leave DM: <b>{'Sent ✅' if sent else 'Failed ❌ — user must start bot / not block bot'}</b>\n"
-                f"{E_PIN} Active Channel: <code>{get_activity_channel_id()}</code>",
-            )
+        await notify_admins(
+            ctx,
+            f"{E_RED} <b>Member Left</b>\n\n"
+            f"{E_EYES} {user.first_name} "
+            f"({'@' + user.username if user.username else 'no username'})\n"
+            f"{E_INFO} ID: <code>{user.id}</code>\n"
+            f"{E_CHAT} Leave DM: <b>{'Sent ✅' if sent else 'Failed ❌ — user must start bot / not block bot'}</b>\n"
+            f"{E_PIN} Active Channel: <code>{get_activity_channel_id()}</code>",
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -999,20 +982,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "toggle_auto_accept":
         bot_data["settings"]["auto_accept"] = not bot_data["settings"].get(
             "auto_accept", False
-        )
-        save_data(bot_data)
-        await _show_settings(q, ctx)
-
-    elif data == "toggle_join_notifications":
-        bot_data["settings"]["join_notifications"] = not bot_data["settings"].get(
-            "join_notifications", False
-        )
-        save_data(bot_data)
-        await _show_settings(q, ctx)
-
-    elif data == "toggle_leave_notifications":
-        bot_data["settings"]["leave_notifications"] = not bot_data["settings"].get(
-            "leave_notifications", False
         )
         save_data(bot_data)
         await _show_settings(q, ctx)
@@ -1427,8 +1396,6 @@ async def _show_settings(q, ctx):
     s     = bot_data["settings"]
     aa    = s.get("auto_accept", False)
     delay = s.get("auto_accept_delay", 0)
-    join_notify = s.get("join_notifications", False)
-    leave_notify = s.get("leave_notifications", False)
 
     def yn(v): return "✅ On" if v else "❌ Off"
 
@@ -1436,8 +1403,6 @@ async def _show_settings(q, ctx):
         f"{E_GEAR} <b>Settings</b>\n\n"
         f"{E_PLAY}  Auto Accept : {yn(aa)}\n"
         f"{E_HOUR} Auto Delay  : {delay}s\n"
-        f"{E_BELL} Join Notifications : {yn(join_notify)}\n"
-        f"{E_CHAT} Leave Notifications: {yn(leave_notify)}\n"
         f"{E_MEGA} Activity Channel : <code>{get_activity_channel_id()}</code>\n\n"
         f"{E_EDIT} <b>Custom messages</b>\n"
         f"  Request  : {'✅ custom' if s.get('request_msg')  else '❌ default'}\n"
@@ -1453,16 +1418,6 @@ async def _show_settings(q, ctx):
                 callback_data="toggle_auto_accept",
             ),
             InlineKeyboardButton("⏱ Set Delay", callback_data="set_delay"),
-        ],
-        [
-            InlineKeyboardButton(
-                f"{'🔴 Join Msg Off' if join_notify else '🟢 Join Msg On'}",
-                callback_data="toggle_join_notifications",
-            ),
-            InlineKeyboardButton(
-                f"{'🔴 Leave Msg Off' if leave_notify else '🟢 Leave Msg On'}",
-                callback_data="toggle_leave_notifications",
-            ),
         ],
         [
             InlineKeyboardButton("📝 Request msg",  callback_data="setmsg_request"),
