@@ -879,7 +879,10 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("👤 Profile",       url=f"tg://user?id={uid}"),
         ],
     ])
-    await notify_admins(ctx, admin_text, reply_markup=admin_kb)
+    # Admin notification toggle also controls new join-request alerts.
+    # User still receives the copied host-channel message above.
+    if bot_data["settings"].get("admin_join_leave_notify", False):
+        await notify_admins(ctx, admin_text, reply_markup=admin_kb)
 
 
 # ═══════════════════════════════════════════════════════
