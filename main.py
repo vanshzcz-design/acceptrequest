@@ -826,11 +826,14 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     # ── Already recorded → send host-channel copy again (rejoin/duplicate request) ──
     if uid_str in bot_data["pending_requests"]:
+        # Rejoin/duplicate request: ALWAYS copy host-channel messages only.
+        # No normal fallback message here, so premium emojis stay exactly as in host channel.
         copied_count = await copy_channel_messages_to_user(ctx, uid)
         if copied_count == 0:
-            first_name = user.first_name or "there"
-            text, ents = fmt_request_msg(first_name)
-            await safe_send(ctx, uid, text, entities=ents)
+            logger.warning(
+                f"No host-channel messages copied for duplicate request uid={uid}. "
+                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
+            )
         return
 
     # ── Record the request ───────────────────────────────
@@ -863,9 +866,14 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_data["stats"]["total_accepted"] += 1
         save_data(bot_data)
 
-        text, ents = fmt_accepted_msg(first_name)
-        await safe_send(ctx, uid, text, entities=ents)
-        await copy_channel_messages_to_user(ctx, uid)
+        # Auto-accept request DM: ALWAYS copy host-channel messages only.
+        # Do not send the normal accepted/request message here.
+        copied_count = await copy_channel_messages_to_user(ctx, uid)
+        if copied_count == 0:
+            logger.warning(
+                f"No host-channel messages copied for auto-accepted request uid={uid}. "
+                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
+            )
         return
 
     # ── Manual-review flow ───────────────────────────────
@@ -873,8 +881,10 @@ async def on_join_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # copy_message preserves premium animated emoji entities.
     copied_count = await copy_channel_messages_to_user(ctx, uid)
     if copied_count == 0:
-        text, ents = fmt_request_msg(first_name)
-        await safe_send(ctx, uid, text, entities=ents)
+        logger.warning(
+            f"No host-channel messages copied for new request uid={uid}. "
+            f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
+        )
 
     # Notify admins with accept / decline buttons
     admin_text = (
@@ -945,9 +955,13 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         save_data(bot_data)
 
-        first_name = user.first_name or "there"
-        text, ents = fmt_welcome_msg(first_name)
-        await safe_send(ctx, user.id, text, entities=ents)
+        # Member joined: copy host-channel message only; do not send normal welcome message.
+        copied_count = await copy_channel_messages_to_user(ctx, user.id)
+        if copied_count == 0:
+            logger.warning(
+                f"No host-channel messages copied for joined member uid={user.id}. "
+                f"Check forward source={get_forward_source_channel_id()} and msg_ids={FORWARD_MSG_IDS}"
+            )
 
         if bot_data["settings"].get("admin_join_leave_notify", False):
             await notify_admins(
